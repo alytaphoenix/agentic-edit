@@ -1,0 +1,20 @@
+# Compiled binary
+/aed
+
+# Go build/test artifacts
+*.exe
+*.out
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test coverage
+*.test
+coverage.txt
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
