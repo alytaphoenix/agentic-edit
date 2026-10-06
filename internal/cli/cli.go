@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"agentic-edit/internal/exec"
@@ -19,6 +20,10 @@ import (
 	"agentic-edit/internal/safety"
 	"agentic-edit/internal/verify"
 )
+
+// maxFileBytes caps how large a target file may be. Files above this (or that
+// look binary) are rejected up front.
+const maxFileBytes = 50 * 1024 * 1024
 
 const usageText = `aed — agentic file editing with awk/sed/grep + Laya
 
@@ -32,7 +37,10 @@ edit options:
   --dry-run        Preview only. Default: on (preview). Use -y to apply.
   -y, --yes        Apply without confirmation
   --verify         Verify after applying (grep asserts + optional Laya review)
-  --no-llm         Skip LLM; use the rule-based generator only
+  --llm            Use an LLM (Laya/Ollama/OpenAI) to plan the edit (opt-in)
+  --no-llm         Skip LLM; use the deterministic generator only
+  --force          Allow whole-file destructive deletes (e.g. delete matching .)
+  --root           Workspace root for path confinement (default: current dir)
   --laya-url       Laya MCP URL (default http://127.0.0.1:8420/mcp/)
   --laya-token     Laya MCP bearer token (env LAYA_MCP_TOKEN)
   --model          Local LLM model name (default llama3.1)
@@ -76,7 +84,10 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	yes := fs.Bool("y", false, "apply without confirmation")
 	fs.BoolVar(yes, "yes", false, "apply without confirmation")
 	verifyOn := fs.Bool("verify", false, "verify after applying")
-	noLLM := fs.Bool("no-llm", false, "skip LLM; rule-based only")
+	llmOn := fs.Bool("llm", false, "use an LLM to plan the edit")
+	noLLM := fs.Bool("no-llm", false, "skip LLM; deterministic only")
+	force := fs.Bool("force", false, "allow whole-file destructive deletes")
+	rootFlag := fs.String("root", "", "workspace root for path confinement")
 	layaURL := fs.String("laya-url", "http://127.0.0.1:8420/mcp/", "Laya MCP URL")
 	layaToken := fs.String("laya-token", os.Getenv("LAYA_MCP_TOKEN"), "Laya MCP token")
 	model := fs.String("model", "llama3.1", "local LLM model name")
@@ -97,21 +108,51 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	contents := map[string]string{}
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", f, err)
-			return 1
+	useLLM := *llmOn && !*noLLM
+	forceDeletes := *force
+	root := *rootFlag
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
 		}
-		contents[f] = string(data)
 	}
 
-	intent := plan.Parse(*action, files)
+	// Confinement + read + guards. Files are resolved to real paths inside the
+	// workspace root, size-checked, and rejected if they look binary.
+	confined := make([]string, 0, len(files))
+	contents := map[string]string{}
+	origStat := map[string]os.FileInfo{}
+	for _, f := range files {
+		real, err := confine(f, root)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		data, err := os.ReadFile(real)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", real, err)
+			return 1
+		}
+		if err := checkText(real, data); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		contents[real] = string(data)
+		info, err := os.Stat(real)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: cannot stat %s: %v\n", real, err)
+			return 1
+		}
+		origStat[real] = info
+		confined = append(confined, real)
+	}
+	defer exec.Cleanup()
+
+	intent := plan.Parse(*action, confined)
 
 	client := laya.New(*layaURL, *layaToken)
 	var layaCtx string
-	if !*noLLM {
+	if useLLM {
 		layaCtx = plan.Enrich(context.Background(), client, intent)
 		if layaCtx != "" {
 			fmt.Fprintf(stdout, "[context] %s\n", strings.ReplaceAll(layaCtx, "\n", "\n           "))
@@ -122,7 +163,8 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		Intent:      intent,
 		Contents:    contents,
 		LayaContext: layaCtx,
-		UseLLM:      !*noLLM,
+		UseLLM:      useLLM,
+		Force:       forceDeletes,
 		Model:       *model,
 		OllamaURL:   *ollamaURL,
 		APIKey:      *apiKey,
@@ -158,7 +200,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		after[f] = out
 	}
 
-	for _, f := range files {
+	for _, f := range confined {
 		d := exec.LineDiff(contents[f], after[f])
 		if !hasDiff(d) {
 			fmt.Fprintf(stdout, "  (no change to %s)\n", f)
@@ -173,13 +215,27 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	// Stale-edit guard: abort if any target changed since the preview.
+	for _, f := range confined {
+		newInfo, err := os.Stat(f)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %q no longer accessible: %v\n", f, err)
+			return 1
+		}
+		old := origStat[f]
+		if old != nil && (old.ModTime().UnixNano() != newInfo.ModTime().UnixNano() || old.Size() != newInfo.Size()) {
+			fmt.Fprintf(stderr, "error: %q changed since preview; aborting\n", f)
+			return 1
+		}
+	}
+
 	if !*yes && !confirm(stdin, stdout) {
 		fmt.Fprintln(stdout, "aborted")
 		return 0
 	}
 
 	for _, op := range res.Ops {
-		for _, f := range files {
+		for _, f := range confined {
 			if op.Path != "" && op.Path != f {
 				continue
 			}
@@ -194,7 +250,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	if *verifyOn {
-		res2 := verify.Run(res, contents, after, client, !*noLLM)
+		res2 := verify.Run(res, contents, after, client, useLLM)
 		status := "ok"
 		if !res2.OK {
 			status = "FAILED"
@@ -205,7 +261,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
-	if *egress != "" && client.Enabled() && client.Ping(context.Background()) {
+	if *egress != "" && useLLM && client.Enabled() && client.Ping(context.Background()) {
 		if txt, err := client.CallTool(context.Background(), *egress, map[string]any{"description": intent.Description}); err != nil {
 			fmt.Fprintf(stderr, "egress skipped: %v\n", err)
 		} else {
@@ -277,6 +333,46 @@ func listLayaTools(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%-24s %s\n", t.Name, t.Description)
 	}
 	return 0
+}
+
+// confine resolves path against the workspace root and refuses anything that
+// escapes it (via .. or symlinks). It returns the resolved real path.
+func confine(path, root string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	real := abs
+	if _, err := os.Stat(abs); err == nil {
+		if r, err := filepath.EvalSymlinks(abs); err == nil {
+			real = r
+		}
+	}
+	rootReal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("workspace root %q is not accessible: %v", root, err)
+	}
+	rel, err := filepath.Rel(rootReal, real)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("%q is outside the workspace root %q", path, root)
+	}
+	return real, nil
+}
+
+// checkText rejects files that are too large or contain NUL bytes (binary).
+func checkText(name string, data []byte) error {
+	if len(data) > maxFileBytes {
+		return fmt.Errorf("%q exceeds max size %d bytes", name, maxFileBytes)
+	}
+	for _, b := range data {
+		if b == 0 {
+			return fmt.Errorf("%q looks like a binary file (contains a NUL byte)", name)
+		}
+	}
+	return nil
 }
 
 // hasDiff reports whether a LineDiff output contains any removed/added lines.

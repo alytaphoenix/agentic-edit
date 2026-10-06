@@ -44,7 +44,10 @@ aed grep -E '^todo' -n *.md
 | `--dry-run` | Preview only. Default on; pass `-y` to apply. |
 | `-y, --yes` | Apply without the interactive confirmation prompt. |
 | `--verify` | After applying, assert the change and summarize the diff. |
-| `--no-llm` | Skip LLM/Laya; use the rule-based generator only. |
+| `--llm` | Enable the LLM (Laya/Ollama/OpenAI) to plan the edit (**opt-in**). |
+| `--no-llm` | Skip LLM/Laya; use the deterministic generator only. |
+| `--force` | Allow whole-file destructive deletes (e.g. delete matching `.`). |
+| `--root` | Workspace root for path confinement (default: current dir). |
 | `--laya-url` | Laya MCP endpoint (default `http://127.0.0.1:8420/mcp/`). |
 | `--laya-token` | Laya bearer token (env `LAYA_MCP_TOKEN`). |
 | `--model` | Local LLM model name (default `llama3.1`). |
@@ -74,10 +77,8 @@ natural-language instruction
    plan.Enrich (Laya)    → optional background context (skipped if Laya off)
           │
           ▼
-   gen.Generate          → produces awk/sed/grep operations
-        ├─ Laya pipeline  → tries the model Laya is configured with
-        ├─ OpenAI-compatible / Ollama → fallback LLMs
-        └─ rule-based     → deterministic fallback when no LLM is reachable
+   gen.Generate          → typed ops via intent.Parse + compile.Render
+         └─ LLM (opt-in, --llm) → emits typed ops only, validated before render
           │
           ▼
    safety.Validate       → denylist blocks :d, 1,$d, rm, system(), etc.
@@ -89,13 +90,38 @@ natural-language instruction
    Apply (backup → atomic replace) → verify (asserts + diff summary)
 ```
 
+By default the tool is fully deterministic: a small keyword grammar turns the
+instruction into **typed operations**, which are rendered through a fixed
+template whitelist. The only way to inject a command is as one of these known
+shapes — never a free-form script. The LLM is strictly **opt-in** (`--llm`);
+when used, the model may only emit structured, typed operations, which are
+validated before rendering.
 ### Safety
 
-- **Backups**: applying writes `<file>.bak` before mutating.
-- **Atomic replace**: output is written to a temp file and renamed into place.
-- **Denylist** (`internal/safety`): operations containing `:d`, `1,$d`,
-  `1,$ s`, `rm -`, `> /dev/null`, `system(`, or `exit(1)` are rejected.
+- **Safe by construction**: commands are produced from a fixed template
+  whitelist (`internal/compile`) by escaping inputs; a free-form script can
+  never be injected. This is the primary guarantee.
+- **Denylist** (`internal/safety`): defense-in-depth; operations containing
+  `:d`, `1,$d`, `1,$ s`, `rm -`, `> /dev/null`, `system(`, or `exit(1)` are
+  rejected.
+- **Path confinement**: files are resolved (realpath + symlink check) and must
+  stay inside `--root` (default: current dir). `..` escapes are refused.
+- **Binary / size guard**: files over 50 MB or containing NUL bytes are
+  rejected up front.
+- **Stale-edit guard**: each target's mtime+size are re-checked right before
+  apply; if the file changed since the preview, the edit is aborted.
+- **Mode preservation + fsync**: applying writes to a temp file, fsyncs it, and
+  preserves the original file mode (including executable bits) across the atomic
+  rename.
+- **Exec timeout**: every awk/sed/grep call is bounded (`exec.DefaultTimeout`,
+  30s).
+- **Private temp dir**: temp files live in a process-private directory that is
+  cleaned up on exit.
+- **Backups**: applying writes `<file>.bak` before mutating, and rolls back on
+  any failure.
 - **Preview first**: `edit` previews by default; use `-y` to apply.
+- **Destructive deletes gated**: whole-file deletes (a pattern matching every
+  line) require `--force`.
 
 ## Architecture
 
@@ -104,7 +130,9 @@ natural-language instruction
 | `cmd/aed` | CLI entrypoint |
 | `internal/cli` | Flag parsing, the edit/grep command loop |
 | `internal/plan` | Intent parsing + Laya context enrichment |
-| `internal/gen` | Turns intent into awk/sed/grep operations (LLM + rule-based) |
+| `internal/intent` | Parses instruction into typed ops; validates structure |
+| `internal/compile` | Renders typed ops through a fixed safe-template whitelist |
+| `internal/gen` | Wires LLM (opt-in, typed ops only) + deterministic pipeline |
 | `internal/exec` | Safe `DryRun`/`RunInPlace` wrappers over awk/sed/grep, line search, diffing |
 | `internal/safety` | Denylist validation |
 | `internal/verify` | Post-apply asserts + diff summary + optional Laya review |

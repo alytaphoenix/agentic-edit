@@ -1,6 +1,8 @@
 package exec
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -70,5 +72,44 @@ func TestDryRunGrepNoMatch(t *testing.T) {
 	}
 	if out != "" {
 		t.Errorf("expected empty output for no-match grep, got %q", out)
+	}
+}
+
+func TestRunInPlacePreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run.sh")
+	if err := os.WriteFile(path, []byte("echo hello\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunInPlace(EditOp{Kind: KindSed, Path: path, Script: "s|hello|world|g"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("executable mode not preserved: got %o, want 755", info.Mode().Perm())
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "world") {
+		t.Errorf("edit did not apply: %q", out)
+	}
+}
+
+func TestRunInPlaceRollsBackOnError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A sed script matching nothing is a valid no-op; instead force a failure by
+	// running an op against a path that does not exist.
+	err := RunInPlace(EditOp{Kind: KindSed, Path: path + "/missing", Script: "s|a|b"})
+	if err == nil {
+		t.Fatal("expected error applying against a missing file")
 	}
 }

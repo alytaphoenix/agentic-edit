@@ -4,11 +4,14 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Kind identifies the underlying utility.
@@ -17,6 +20,9 @@ const (
 	KindAwk  = "awk"
 	KindGrep = "grep"
 )
+
+// DefaultTimeout bounds how long any single awk/sed/grep invocation may run.
+var DefaultTimeout = 30 * time.Second
 
 // EditOp is a single planned operation against a file.
 type EditOp struct {
@@ -51,28 +57,30 @@ func DryRun(op EditOp, content string) (string, error) {
 	}
 }
 
-// RunInPlace applies the operation to op.Path. It writes a .bak backup first and
-// performs an atomic replace, rolling back on any failure.
+// RunInPlace applies the operation to op.Path. It writes a .bak backup first,
+// preserves the original file mode, and performs an atomic replace, rolling
+// back on any failure.
 func RunInPlace(op EditOp) error {
 	if op.Kind == KindGrep || op.Path == "" {
 		return nil
 	}
+	info, err := os.Stat(op.Path)
+	if err != nil {
+		return err
+	}
 	if err := Backup(op.Path); err != nil {
 		return err
 	}
-	cmd, script, err := buildOpCommand(op)
-	if err != nil {
-		Rollback(op.Path)
-		return err
-	}
-	defer os.Remove(script)
-	out, err := cmd.Output()
+	out, script, err := applyOp(op)
 	if err != nil {
 		Rollback(op.Path)
 		return fmt.Errorf("%s failed: %w", op.Kind, err)
 	}
+	if script != "" {
+		defer os.Remove(script)
+	}
 	tmp := op.Path + ".aed.tmp"
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+	if err := writePreserving(tmp, out, info.Mode()); err != nil {
 		Rollback(op.Path)
 		return err
 	}
@@ -83,20 +91,46 @@ func RunInPlace(op EditOp) error {
 	return nil
 }
 
-// Backup copies path to path.bak.
+// applyOp runs a mutating op and returns its stdout plus any temp script path.
+func applyOp(op EditOp) ([]byte, string, error) {
+	switch op.Kind {
+	case KindSed:
+		script, err := writeTemp(op.Script)
+		if err != nil {
+			return nil, "", err
+		}
+		out, err := run("sed", "", "-f", script, op.Path)
+		return out, script, err
+	case KindAwk:
+		out, err := run("awk", "", op.Script, op.Path)
+		return out, "", err
+	default:
+		return nil, "", fmt.Errorf("cannot apply %s in place", op.Kind)
+	}
+}
+
+// Backup copies path to path.bak, preserving the file mode.
 func Backup(path string) error {
 	in, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path+".bak", in, 0o644)
+	info, err := os.Stat(path)
+	mode := os.FileMode(0o644)
+	if err == nil {
+		mode = info.Mode()
+	}
+	return writePreserving(path+".bak", in, mode)
 }
 
 // Rollback restores path from path.bak and removes any leftover temp file.
 func Rollback(path string) {
 	os.Remove(path + ".aed.tmp")
-	if data, err := os.ReadFile(path + ".bak"); err == nil {
-		_ = os.WriteFile(path, data, 0o644)
+	if info, err := os.Stat(path + ".bak"); err == nil {
+		data, rerr := os.ReadFile(path + ".bak")
+		if rerr == nil {
+			_ = writePreserving(path, data, info.Mode())
+		}
 	}
 }
 
@@ -108,8 +142,10 @@ func Search(pattern string, files []string, extended bool) ([]Line, error) {
 	}
 	args = append(args, pattern)
 	args = append(args, files...)
-	cmd := exec.Command("grep", args...)
-	data, _ := cmd.Output() // exit status 1 (no matches) is not an error
+	data, err := grepOut(args...)
+	if err != nil {
+		return nil, err
+	}
 
 	var lines []Line
 	for _, raw := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
@@ -141,8 +177,10 @@ func Count(pattern string, files []string, extended bool) (map[string]int, error
 			args = append(args, "-E")
 		}
 		args = append(args, pattern, f)
-		cmd := exec.Command("grep", args...)
-		data, _ := cmd.Output() // exit 1 when zero matches is fine
+		data, err := grepOut(args...)
+		if err != nil {
+			return nil, err
+		}
 		out[f], _ = strconv.Atoi(strings.TrimSpace(string(data)))
 	}
 	return out, nil
@@ -211,19 +249,40 @@ func lcs(a, b []string) [][]int {
 	return t
 }
 
+// --- command execution ---
+
+// run invokes a command with a timeout, feeding optional stdin.
+func run(name string, stdin string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	return cmd.Output()
+}
+
+// grepOut runs grep and treats "no matches" (exit status 1) as an empty result
+// rather than an error.
+func grepOut(args ...string) ([]byte, error) {
+	out, err := run("grep", "", args...)
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && (exitErr.ExitCode() == 1 || exitErr.ExitCode() == -1) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
 func runStdin(name, script, stdinData string) (string, error) {
-	cmd := exec.Command(name, script)
-	cmd.Stdin = strings.NewReader(stdinData)
-	out, err := cmd.Output()
+	out, err := run(name, stdinData, script)
 	return string(out), err
 }
 
 func grepStdin(pattern, content string) (string, error) {
-	cmd := exec.Command("grep", "-n", pattern)
-	cmd.Stdin = strings.NewReader(content)
-	out, err := cmd.Output()
+	out, err := run("grep", content, "-n", pattern)
 	if err != nil {
-		// Exit status 1 means "no matches": a valid empty result, not an error.
 		if exitErr, ok := err.(*exec.ExitError); ok && (exitErr.ExitCode() == 1 || exitErr.ExitCode() == -1) {
 			return "", nil
 		}
@@ -232,44 +291,79 @@ func grepStdin(pattern, content string) (string, error) {
 	return string(out), nil
 }
 
-// buildOpCommand constructs the command that applies an edit op in place. Sed is
-// run via a temporary -f script file so the POSIX `a\`/`i\` forms work on both
-// GNU (Linux) and BSD (macOS) sed.
-func buildOpCommand(op EditOp) (*exec.Cmd, string, error) {
-	switch op.Kind {
-	case KindSed:
-		script, err := writeTemp(op.Script)
-		if err != nil {
-			return nil, "", err
-		}
-		return exec.Command("sed", "-f", script, op.Path), script, nil
-	case KindAwk:
-		return exec.Command("awk", op.Script, op.Path), "", nil
-	default:
-		return nil, "", fmt.Errorf("cannot apply %s in place", op.Kind)
-	}
-}
-
 func runSedStdin(script, stdinData string) (string, error) {
 	path, err := writeTemp(script)
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(path)
-	cmd := exec.Command("sed", "-f", path)
-	cmd.Stdin = strings.NewReader(stdinData)
-	out, err := cmd.Output()
+	out, err := run("sed", stdinData, "-f", path)
 	return string(out), err
 }
 
-// writeTemp writes content to a temp file and returns its path. A trailing
-// newline is ensured so the final sed command line is properly terminated; BSD
-// sed otherwise merges an unterminated `a\`/`i\` text line onto the next input.
+// writePreserving writes data to path using the given mode and fsyncs it before
+// returning, so the mode (including executable bits) is preserved exactly.
+func writePreserving(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	// OpenFile applies the umask; enforce the requested mode explicitly.
+	if err := os.Chmod(path, mode); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// --- temp files ---
+
+var (
+	tempOnce   sync.Once
+	tempDirStr string
+)
+
+// tempDir returns a private, process-wide temp directory created with 0700
+// permissions. Callers should defer exec.Cleanup() to remove it on exit.
+func tempDir() (string, error) {
+	tempOnce.Do(func() {
+		p, err := os.MkdirTemp("", "aed-*")
+		if err == nil {
+			tempDirStr = p
+		}
+	})
+	return tempDirStr, nil
+}
+
+// Cleanup removes the process-wide temp directory.
+func Cleanup() error {
+	if tempDirStr != "" {
+		return os.RemoveAll(tempDirStr)
+	}
+	return nil
+}
+
+// writeTemp writes content to a private temp file and returns its path. A
+// trailing newline is ensured so the final sed command line is properly
+// terminated; BSD sed otherwise merges an unterminated `a\`/`i\` text line onto
+// the next input.
 func writeTemp(content string) (string, error) {
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
-	f, err := os.CreateTemp("", "aed-sed-*.sed")
+	dir, err := tempDir()
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, "aed-sed-*.sed")
 	if err != nil {
 		return "", err
 	}
