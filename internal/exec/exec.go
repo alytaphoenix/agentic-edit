@@ -146,7 +146,23 @@ func Search(pattern string, files []string, extended bool) ([]Line, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseGrep(data), nil
+}
 
+// SearchFixed runs grep -HnF (fixed-string) over files and returns parsed
+// matches. It is used by the post-apply guard to assert literal replacement
+// values without interpreting regex metacharacters.
+func SearchFixed(pattern string, files []string) ([]Line, error) {
+	args := []string{"-H", "-n", "-F", pattern}
+	args = append(args, files...)
+	data, err := grepOut(args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseGrep(data), nil
+}
+
+func parseGrep(data []byte) []Line {
 	var lines []Line
 	for _, raw := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 		if raw == "" {
@@ -165,7 +181,7 @@ func Search(pattern string, files []string, extended bool) ([]Line, error) {
 		num, _ := strconv.Atoi(rest[:f2])
 		lines = append(lines, Line{File: file, Num: num, Text: rest[f2+1:]})
 	}
-	return lines, nil
+	return lines
 }
 
 // Count returns the number of matching lines per file.
@@ -177,6 +193,20 @@ func Count(pattern string, files []string, extended bool) (map[string]int, error
 			args = append(args, "-E")
 		}
 		args = append(args, pattern, f)
+		data, err := grepOut(args...)
+		if err != nil {
+			return nil, err
+		}
+		out[f], _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+	return out, nil
+}
+
+// CountFixed returns the number of fixed-string matching lines per file.
+func CountFixed(pattern string, files []string) (map[string]int, error) {
+	out := map[string]int{}
+	for _, f := range files {
+		args := []string{"-c", "-F", pattern, f}
 		data, err := grepOut(args...)
 		if err != nil {
 			return nil, err
@@ -327,19 +357,35 @@ func writePreserving(path string, data []byte, mode os.FileMode) error {
 // --- temp files ---
 
 var (
-	tempOnce   sync.Once
+	tempMu     sync.Mutex
 	tempDirStr string
 )
 
 // tempDir returns a private, process-wide temp directory created with 0700
-// permissions. Callers should defer exec.Cleanup() to remove it on exit.
+// permissions. Callers should defer exec.Cleanup() to remove it on exit. The
+// directory is recreated if it has been removed (e.g. by a prior Cleanup call),
+// so repeated invocations in the same process — such as test suites — remain
+// safe.
 func tempDir() (string, error) {
-	tempOnce.Do(func() {
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	if tempDirStr == "" {
 		p, err := os.MkdirTemp("", "aed-*")
-		if err == nil {
-			tempDirStr = p
+		if err != nil {
+			return "", err
 		}
-	})
+		tempDirStr = p
+		return tempDirStr, nil
+	}
+	if info, err := os.Stat(tempDirStr); err != nil || !info.IsDir() {
+		os.RemoveAll(tempDirStr)
+		tempDirStr = ""
+		p, err := os.MkdirTemp("", "aed-*")
+		if err != nil {
+			return "", err
+		}
+		tempDirStr = p
+	}
 	return tempDirStr, nil
 }
 

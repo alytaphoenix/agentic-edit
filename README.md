@@ -43,7 +43,9 @@ aed grep -E '^todo' -n *.md
 | `-a, --action` | Natural-language instruction **[required]** |
 | `--dry-run` | Preview only. Default on; pass `-y` to apply. |
 | `-y, --yes` | Apply without the interactive confirmation prompt. |
-| `--verify` | After applying, assert the change and summarize the diff. |
+| `--verify` | After applying, assert the change and summarize the diff. **Default on.** |
+| `--no-verify` | Disable the post-apply verification guard. A guard failure exits `3`. |
+| `--show-secrets` | Do not redact secrets from LLM prompts, stdout diffs, and the review prompt. Alias: `--no-scrub`. **Default off (scrub on).** |
 | `--llm` | Enable the LLM (Laya/Ollama/OpenAI) to plan the edit (**opt-in**). |
 | `--no-llm` | Skip LLM/Laya; use the deterministic generator only. |
 | `--force` | Allow whole-file destructive deletes (e.g. delete matching `.`). |
@@ -119,6 +121,16 @@ validated before rendering.
   cleaned up on exit.
 - **Backups**: applying writes `<file>.bak` before mutating, and rolls back on
   any failure.
+- **Secret scrubbing**: file contents flowing to an LLM prompt, printed diffs,
+  and the verify-review prompt are redacted by `internal/scrub` (AWS keys,
+  private keys, tokens, connection strings, `key = value` assignments) unless
+  `--show-secrets` (alias `--no-scrub`) is passed. Redaction is output-only — it
+  never changes what is written to disk.
+- **Post-apply guard**: `verify` asserts the change actually landed (Assert =
+  new value present, Deny = old value / deleted pattern absent) using literal
+  `grep -F` matches, skips no-ops, and prints an error diff and exits `3` if not.
+  `--no-verify` opts out. On a failure in an interactive shell it prompts to
+  restore the file from its backup.
 - **Preview first**: `edit` previews by default; use `-y` to apply.
 - **Destructive deletes gated**: whole-file deletes (a pattern matching every
   line) require `--force`.
@@ -135,6 +147,7 @@ validated before rendering.
 | `internal/gen` | Wires LLM (opt-in, typed ops only) + deterministic pipeline |
 | `internal/exec` | Safe `DryRun`/`RunInPlace` wrappers over awk/sed/grep, line search, diffing |
 | `internal/safety` | Denylist validation |
+| `internal/scrub` | Redacts secrets from LLM prompts, stdout, and the review prompt |
 | `internal/verify` | Post-apply asserts + diff summary + optional Laya review |
 | `internal/laya` | Laya MCP client |
 | `internal/llm` | Ollama / OpenAI-compatible HTTP clients |

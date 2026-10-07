@@ -52,13 +52,18 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 		if err != nil {
 			return exec.EditOp{}, err
 		}
-		return exec.EditOp{
+		eo := exec.EditOp{
 			Kind:    exec.KindSed,
 			Script:  script,
 			Assert:  op.Y,
-			Deny:    op.X,
 			Purpose: fmt.Sprintf("replace %q with %q", op.X, op.Y),
-		}, nil
+		}
+		if op.Global {
+			// Only assert the old value is absent for a global replace; a
+			// partial replace can legitimately leave the old value elsewhere.
+			eo.Deny = op.X
+		}
+		return eo, nil
 	case "insert":
 		script, err := insertScript(op.Anchor, op.Text, op.InsertBefore)
 		if err != nil {
@@ -71,6 +76,7 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 		return exec.EditOp{
 			Kind:    exec.KindSed,
 			Script:  script,
+			Assert:  op.Text,
 			Purpose: fmt.Sprintf("insert %q %s anchor %q", op.Text, pos, op.Anchor),
 		}, nil
 	case "delete":
@@ -84,6 +90,8 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 		return exec.EditOp{
 			Kind:    exec.KindSed,
 			Script:  script,
+			Pattern: op.Pattern, // set so the guard treats Deny as a regex
+			Deny:    op.Pattern, // the deleted pattern must be absent
 			Purpose: "delete lines matching " + op.Pattern,
 		}, nil
 	}

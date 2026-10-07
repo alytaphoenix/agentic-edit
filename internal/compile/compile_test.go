@@ -18,6 +18,51 @@ func TestRenderReplace(t *testing.T) {
 	}
 }
 
+// A non-global replace sets Assert but must NOT set Deny, since a partial
+// replace can legitimately leave the old value elsewhere.
+func TestRenderNonGlobalReplaceNoDeny(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, X: "a", Y: "b", Global: false}
+	eo, err := Render(op, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eo.Assert != "b" {
+		t.Errorf("Assert=%q want b", eo.Assert)
+	}
+	if eo.Deny != "" {
+		t.Errorf("Deny=%q want empty for non-global replace", eo.Deny)
+	}
+}
+
+// An insert records the inserted text as its Assert so the guard can confirm
+// it landed.
+func TestRenderInsertAssert(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, Anchor: "config", Text: "NEW", InsertBefore: true}
+	eo, err := Render(op, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eo.Assert != "NEW" {
+		t.Errorf("Assert=%q want NEW", eo.Assert)
+	}
+}
+
+// A delete records its Pattern (for regex matching) and Deny so the guard can
+// confirm the pattern is absent afterward.
+func TestRenderDeleteSetsPatternAndDeny(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, Pattern: "TODO"}
+	eo, err := Render(op, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eo.Pattern != "TODO" {
+		t.Errorf("Pattern=%q want TODO", eo.Pattern)
+	}
+	if eo.Deny != "TODO" {
+		t.Errorf("Deny=%q want TODO", eo.Deny)
+	}
+}
+
 func TestRenderReplaceEscapes(t *testing.T) {
 	op := intent.Op{Kind: intent.KindSed, X: `a\b|c`, Y: "&x", Global: true}
 	eo, err := Render(op, false)

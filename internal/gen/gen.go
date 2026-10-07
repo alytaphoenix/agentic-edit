@@ -31,6 +31,8 @@ type Input struct {
 	APIKey      string
 	BaseURL     string
 	Client      *laya.Client
+	// Scrub redacts secrets from the LLM prompt. nil means identity.
+	Scrub func(string) string
 }
 
 // Result is the set of operations produced for an intent.
@@ -98,17 +100,23 @@ func callLLM(in Input) ([]intent.Op, bool) {
 
 func genPrompt(in Input) string {
 	var b strings.Builder
+	scrub := in.Scrub
+	if scrub == nil {
+		scrub = func(s string) string { return s }
+	}
 	fmt.Fprintf(&b, "Instruction: %s\n", in.Intent.Description)
 	if in.LayaContext != "" {
-		fmt.Fprintf(&b, "\nBackground context from Laya:\n%s\n", in.LayaContext)
+		fmt.Fprintf(&b, "\nBackground context from Laya:\n%s\n", scrub(in.LayaContext))
 	}
 	b.WriteString("\nTarget file contents (first 4000 chars each):\n")
 	for path, content := range in.Contents {
 		if len(content) > 4000 {
 			content = content[:4000] + "\n...[truncated]..."
 		}
-		fmt.Fprintf(&b, "\n### %s\n%s\n", path, content)
+		// Redact secrets before they leave the machine for the model.
+		fmt.Fprintf(&b, "\n### %s\n%s\n", path, scrub(content))
 	}
+	b.WriteString("\nAny text containing the marker [REDACTED] has been redacted for security; do not attempt to match or replace it.\n")
 	b.WriteString(`Respond with ONLY a JSON array (no markdown fences) of typed edit operations. Each object uses one of these shapes:
 {"kind":"sed","x":"<old>","y":"<new>"}
 {"kind":"sed","pattern":"<regex>"}

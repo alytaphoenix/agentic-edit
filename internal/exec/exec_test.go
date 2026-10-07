@@ -113,3 +113,79 @@ func TestRunInPlaceRollsBackOnError(t *testing.T) {
 		t.Fatal("expected error applying against a missing file")
 	}
 }
+
+func TestCountFixed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("foo\nbar\nfoo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, err := CountFixed("foo", []string{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n[path] != 2 {
+		t.Errorf("CountFixed(foo)=%d want 2", n[path])
+	}
+	// Fixed-string matching: a regex metacharacter must be matched literally,
+	// so "a.b" matches only "a.b", not "ab".
+	if err := os.WriteFile(path, []byte("a.b\nab\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, _ = CountFixed("a.b", []string{path})
+	if n[path] != 1 {
+		t.Errorf("CountFixed(a.b)=%d want 1 (literal match)", n[path])
+	}
+}
+
+func TestSearchFixed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("key = AKIA1234567890ABCDEF\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := SearchFixed("AKIA1234567890ABCDEF", []string{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("SearchFixed found %d lines, want 1", len(lines))
+	}
+	if lines[0].Num != 1 {
+		t.Errorf("expected match on line 1, got %d", lines[0].Num)
+	}
+}
+
+// Rollback restores a file from its .bak backup and leaves no temp file behind.
+func TestRollbackRestoresBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	original := "keep this line\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a backup taken before an edit, then a destructive edit.
+	if err := os.WriteFile(path+".bak", []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("totally changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A leftover temp file should also be cleaned up.
+	if err := os.WriteFile(path+".aed.tmp", []byte("junk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	Rollback(path)
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("rollback did not restore original: got %q", string(got))
+	}
+	if _, err := os.Stat(path + ".aed.tmp"); !os.IsNotExist(err) {
+		t.Errorf("expected temp file to be removed, stat err=%v", err)
+	}
+}

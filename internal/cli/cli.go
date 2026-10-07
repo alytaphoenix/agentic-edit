@@ -18,6 +18,7 @@ import (
 	"agentic-edit/internal/laya"
 	"agentic-edit/internal/plan"
 	"agentic-edit/internal/safety"
+	"agentic-edit/internal/scrub"
 	"agentic-edit/internal/verify"
 )
 
@@ -37,8 +38,10 @@ edit options:
   --dry-run        Preview only. Default: on (preview). Use -y to apply.
   -y, --yes        Apply without confirmation
   --verify         Verify after applying (grep asserts + optional Laya review)
+                   (default: on; use --no-verify to disable the post-apply guard)
   --llm            Use an LLM (Laya/Ollama/OpenAI) to plan the edit (opt-in)
   --no-llm         Skip LLM; use the deterministic generator only
+  --show-secrets   Do not redact secrets from LLM prompts and output (alias: --no-scrub)
   --force          Allow whole-file destructive deletes (e.g. delete matching .)
   --root           Workspace root for path confinement (default: current dir)
   --laya-url       Laya MCP URL (default http://127.0.0.1:8420/mcp/)
@@ -83,9 +86,12 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	dry := fs.Bool("dry-run", true, "preview only")
 	yes := fs.Bool("y", false, "apply without confirmation")
 	fs.BoolVar(yes, "yes", false, "apply without confirmation")
-	verifyOn := fs.Bool("verify", false, "verify after applying")
+	verifyOn := fs.Bool("verify", true, "verify after applying (default on)")
+	noVerify := fs.Bool("no-verify", false, "do not verify after applying")
 	llmOn := fs.Bool("llm", false, "use an LLM to plan the edit")
 	noLLM := fs.Bool("no-llm", false, "skip LLM; deterministic only")
+	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets from LLM prompts and output")
+	fs.BoolVar(showSecrets, "no-scrub", false, "alias for --show-secrets")
 	force := fs.Bool("force", false, "allow whole-file destructive deletes")
 	rootFlag := fs.String("root", "", "workspace root for path confinement")
 	layaURL := fs.String("laya-url", "http://127.0.0.1:8420/mcp/", "Laya MCP URL")
@@ -115,6 +121,14 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if wd, err := os.Getwd(); err == nil {
 			root = wd
 		}
+	}
+
+	// scrubFn redacts secrets from LLM prompts and stdout unless --show-secrets.
+	var scrubFn func(string) string
+	if *showSecrets {
+		scrubFn = scrub.NoOp
+	} else {
+		scrubFn = scrub.Redact
 	}
 
 	// Confinement + read + guards. Files are resolved to real paths inside the
@@ -155,7 +169,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if useLLM {
 		layaCtx = plan.Enrich(context.Background(), client, intent)
 		if layaCtx != "" {
-			fmt.Fprintf(stdout, "[context] %s\n", strings.ReplaceAll(layaCtx, "\n", "\n           "))
+			fmt.Fprintf(stdout, "[context] %s\n", scrubFn(layaCtx))
 		}
 	}
 
@@ -170,6 +184,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		APIKey:      *apiKey,
 		BaseURL:     *baseURL,
 		Client:      client,
+		Scrub:       scrubFn,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -205,7 +220,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if !hasDiff(d) {
 			fmt.Fprintf(stdout, "  (no change to %s)\n", f)
 		} else {
-			fmt.Fprintf(stdout, "--- %s\n%s", f, d)
+			fmt.Fprintf(stdout, "--- %s\n%s", f, scrubFn(d))
 		}
 	}
 
@@ -246,17 +261,28 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				return 1
 			}
 		}
-		fmt.Fprintf(stdout, "applied: %s\n", op.Purpose)
+		fmt.Fprintf(stdout, "applied: %s\n", scrubFn(op.Purpose))
 	}
 
-	if *verifyOn {
-		res2 := verify.Run(res, contents, after, client, useLLM)
-		status := "ok"
-		if !res2.OK {
-			status = "FAILED"
-		}
-		fmt.Fprintf(stdout, "verify[%s]: %s\n", status, strings.Join(res2.Notes, " | "))
-		if !res2.OK {
+	if *verifyOn && !*noVerify {
+		res2 := verify.Run(res, contents, after, client, useLLM, scrubFn)
+		if res2.OK {
+			fmt.Fprintf(stdout, "verify[ok]: %s\n", strings.Join(res2.Notes, " | "))
+		} else {
+			// The edit did not land. Report it with an error diff, then ask
+			// (interactive shells only) whether to restore the originals.
+			fmt.Fprintln(stdout, "verify[FAILED]: the edit did not land as expected")
+			for _, n := range res2.Notes {
+				fmt.Fprintf(stdout, "  %s\n", n)
+			}
+			if !*yes && isTerminal(stdin) {
+				if confirmRestore(stdin, stdout) {
+					for _, f := range confined {
+						exec.Rollback(f)
+					}
+					fmt.Fprintln(stdout, "restored original files from backup")
+				}
+			}
 			return 3
 		}
 	}
@@ -265,7 +291,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if txt, err := client.CallTool(context.Background(), *egress, map[string]any{"description": intent.Description}); err != nil {
 			fmt.Fprintf(stderr, "egress skipped: %v\n", err)
 		} else {
-			fmt.Fprintf(stdout, "egress[%s]: %s\n", *egress, txt)
+			fmt.Fprintf(stdout, "egress[%s]: %s\n", *egress, scrubFn(txt))
 		}
 	}
 	return 0
@@ -390,6 +416,32 @@ func confirm(r io.Reader, w io.Writer) bool {
 	line, _ := bufio.NewReader(r).ReadString('\n')
 	line = strings.ToLower(strings.TrimSpace(line))
 	return line == "y" || line == "yes"
+}
+
+// confirmRestore asks whether to roll the edited files back to their .bak
+// originals after a failed verification guard (report-and-ask-to-fix).
+// confirmRestore asks whether to roll the edited files back to their .bak
+// originals after a failed verification guard (report-and-ask-to-fix).
+func confirmRestore(r io.Reader, w io.Writer) bool {
+	fmt.Fprint(w, "verify failed: restore original files from backup? [y/N] ")
+	line, _ := bufio.NewReader(r).ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	return line == "y" || line == "yes"
+}
+
+// isTerminal reports whether r is a character-device terminal (a TTY). Piped
+// or redirected stdin is treated as non-interactive, so the rollback prompt is
+// skipped in scripts and CI.
+func isTerminal(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 type stringList []string
