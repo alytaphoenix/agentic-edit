@@ -45,6 +45,8 @@ aed grep -E '^todo' -n *.md
 | `-y, --yes` | Apply without the interactive confirmation prompt. |
 | `--verify` | After applying, assert the change and summarize the diff. **Default on.** |
 | `--no-verify` | Disable the post-apply verification guard. A guard failure exits `3`. |
+| `--check` | Syntax-check the edited result with the language's own parser (bash, python) **before** applying, so an edit that would leave invalid syntax is aborted **before** anything is written to disk. **Default on** (a regression exits `4`). |
+| `--no-check` | Skip the pre-apply syntax check. Alias for combining with `--verify` in special cases. |
 | `--show-secrets` | Do not redact secrets from LLM prompts, stdout diffs, and the review prompt. Alias: `--no-scrub`. **Default off (scrub on).** |
 | `--llm` | Enable the LLM (Laya/Ollama/OpenAI) to plan the edit (**opt-in**). |
 | `--no-llm` | Skip LLM/Laya; use the deterministic generator only. |
@@ -67,6 +69,27 @@ aed grep [-E] [-c] PATTERN [FILE...]
 A thin wrapper over `grep -Hn` (`-E` for extended regex, `-c` for counts). It
 exits `0` when nothing matches, so it is safe in scripts and previews.
 
+### `check` subcommand
+
+```sh
+aed check FILE [FILE...]
+```
+
+Runs each file's language syntax checker (bash `bash -n`, python `compile()`) and
+prints diagnostics in `path:line:col: message` form. Exits `4` if any file has
+syntax problems. Returns early on I/O or binary/size errors (exit `1`).
+Unsupported file types are reported as skipped, not as failures.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success. |
+| `1` | Argument, I/O, or other runtime error. |
+| `2` | Usage error (unknown command / missing required flag). |
+| `3` | Post-apply verify guard failed (`--no-verify` to opt out). |
+| `4` | Syntax gate: the edit would leave invalid syntax (or `aed check` found problems). Override with `--no-check`. |
+
 ## How it works
 
 ```
@@ -87,6 +110,9 @@ natural-language instruction
           │
           ▼
    Dry-run (awk/sed/grep on in-memory content) → unified diff shown to the user
+          │
+          ▼
+   Syntax gate (internal/lang) — per-language parse of the in-memory result
           │
           ▼
    Apply (backup → atomic replace) → verify (asserts + diff summary)
@@ -131,9 +157,57 @@ validated before rendering.
   `grep -F` matches, skips no-ops, and prints an error diff and exits `3` if not.
   `--no-verify` opts out. On a failure in an interactive shell it prompts to
   restore the file from its backup.
+- **Syntax gate**: before applying, `internal/lang` runs each target's own
+  language parser (currently **bash** via `bash -n`, **python** via `compile()`)
+  on the in-memory result of the edit. A clean → broken transition aborts the
+  edit **before** anything is written and exits `4` (use `--no-check` to
+  override). Files that were already broken stay editable. The gate is
+  pluggable: a language is an `init()`-registered `Checker` (see
+  `internal/lang`). Binary location is overridable via `AED_BASH` /
+  `AED_PYTHON`.
 - **Preview first**: `edit` previews by default; use `-y` to apply.
 - **Destructive deletes gated**: whole-file deletes (a pattern matching every
   line) require `--force`.
+
+## Language support (pluggable syntax gate)
+
+Every target file passes through `internal/lang` before applying, using the
+language's own parser — not a heuristic. Supported today:
+
+| Language | Parser | Env override |
+|----------|--------|--------------|
+| bash | `bash -n` | `AED_BASH` |
+| python | `compile()` (via `python3`) | `AED_PYTHON` |
+| go | `go/parser` (native, no external tool) | — |
+| json / jsonl | `encoding/json` (native) | — |
+| xml | `encoding/xml` (native) | — |
+| toml | `tomllib` (via `python3`) | `AED_PYTHON` |
+| ini / cfg | `configparser` (via `python3`) | `AED_PYTHON` |
+| properties | native line-level check | — |
+| yaml / yml | PyYAML (via `python3`) — needs `pip install pyyaml`; otherwise skipped | `AED_PYTHON` |
+
+**Adding a language** is intentionally a one-file job: implement or reuse a
+`Checker` and call `lang.Register(...)` from an `init()`. Most languages never
+need a Go parser at all — wrap their CLI in a `CommandChecker`:
+
+```go
+func init() {
+	lang.Register(&lang.CommandChecker{
+		Language:   "ruby",
+		Extensions: []string{".rb"},
+		Shebangs:   []string{"ruby"},
+		Bin:        "ruby",
+		Env:        "AED_RUBY",
+		Args:       []string{"-c", lang.StdinPlaceholder},
+		Timeout:    10 * time.Second,
+		Parse: func(output string) []lang.Diagnostic { /* map lines -> Diagnostic */ return nil },
+	})
+}
+```
+
+That one file makes `aed edit` show `syntax[FAILED]` (exit `4`) for Go files
+too, with no changes to `cli.go`. New-language support is also what lets
+`aed check` know about it automatically — no flag or register-table edits.
 
 ## Architecture
 
@@ -147,6 +221,7 @@ validated before rendering.
 | `internal/gen` | Wires LLM (opt-in, typed ops only) + deterministic pipeline |
 | `internal/exec` | Safe `DryRun`/`RunInPlace` wrappers over awk/sed/grep, line search, diffing |
 | `internal/safety` | Denylist validation |
+| `internal/lang` | Per-language syntax gate (pluggable: bash, python today; CommandChecker adapts any CLI) |
 | `internal/scrub` | Redacts secrets from LLM prompts, stdout, and the review prompt |
 | `internal/verify` | Post-apply asserts + diff summary + optional Laya review |
 | `internal/laya` | Laya MCP client |

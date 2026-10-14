@@ -15,6 +15,7 @@ import (
 
 	"agentic-edit/internal/exec"
 	"agentic-edit/internal/gen"
+	"agentic-edit/internal/lang"
 	"agentic-edit/internal/laya"
 	"agentic-edit/internal/plan"
 	"agentic-edit/internal/safety"
@@ -62,6 +63,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "edit":
 		return runEdit(args[1:], stdin, stdout, stderr)
+	case "check":
+		return runCheck(args[1:], stdout, stderr)
 	case "grep":
 		return runGrep(args[1:], stdout, stderr)
 	case "list-laya-tools":
@@ -88,6 +91,8 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.BoolVar(yes, "yes", false, "apply without confirmation")
 	verifyOn := fs.Bool("verify", true, "verify after applying (default on)")
 	noVerify := fs.Bool("no-verify", false, "do not verify after applying")
+	checkOn := fs.Bool("check", true, "syntax-check edited files with their own language checker (bash, python) before applying")
+	noCheck := fs.Bool("no-check", false, "skip the pre-apply syntax check; a syntax regression exits 4")
 	llmOn := fs.Bool("llm", false, "use an LLM to plan the edit")
 	noLLM := fs.Bool("no-llm", false, "skip LLM; deterministic only")
 	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets from LLM prompts and output")
@@ -224,6 +229,37 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Syntax gate: parse the edited result with each language's own checker
+	// before anything is written. A file only counts as a regression if it
+	// parsed cleanly before the edit — files that were already broken stay
+	// editable so aed can still be used to repair them.
+	if *checkOn && !*noCheck {
+		reports := lang.CheckEdits(context.Background(), contents, after)
+		failures, passed := 0, 0
+		for _, r := range reports {
+			switch r.Status {
+			case lang.Failed:
+				failures++
+				for _, d := range r.Diags {
+					fmt.Fprintln(stdout, scrubFn(d.String()))
+				}
+			case lang.Passed:
+				passed++
+			case lang.Skipped:
+				if r.Lang != "" {
+					fmt.Fprintf(stdout, "syntax[skip]: %s\n", r.Reason)
+				}
+			}
+		}
+		if failures > 0 {
+			fmt.Fprintln(stdout, "syntax[FAILED]: the edit would leave invalid syntax; nothing was applied (--no-check to override)")
+			return 4
+		}
+		if passed > 0 {
+			fmt.Fprintf(stdout, "syntax[ok]: %d file(s) parse cleanly\n", passed)
+		}
+	}
+
 	apply := *yes || !*dry
 	if !apply {
 		fmt.Fprintln(stdout, "\n[dry-run] preview only; no files modified. Re-run with -y to apply.")
@@ -334,6 +370,57 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, l := range lines {
 		fmt.Fprintf(stdout, "%s:%d:%s\n", l.File, l.Num, l.Text)
+	}
+	return 0
+}
+
+func runCheck(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paths := fs.Args()
+	if len(paths) == 0 {
+		fmt.Fprintln(stderr, "usage: aed check FILE...")
+		return 2
+	}
+	defer exec.Cleanup()
+
+	problems := 0
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", p, err)
+			return 1
+		}
+		if err := checkText(abs, data); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		rep := lang.Check(context.Background(), abs, string(data))
+		switch rep.Status {
+		case lang.Failed:
+			problems++
+			for _, d := range rep.Diags {
+				fmt.Fprintln(stdout, scrub.Redact(d.String()))
+			}
+		case lang.Passed:
+			fmt.Fprintf(stdout, "%s: ok (%s)\n", p, rep.Lang)
+		case lang.Skipped:
+			if rep.Lang != "" {
+				fmt.Fprintf(stdout, "%s: skipped (%s)\n", p, rep.Reason)
+			} else {
+				fmt.Fprintf(stdout, "%s: skipped (no checker for this file type)\n", p)
+			}
+		}
+	}
+	if problems > 0 {
+		return 4
 	}
 	return 0
 }
