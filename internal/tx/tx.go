@@ -24,6 +24,18 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
+)
+
+// fileKind is the filesystem action a staged File performs.
+type fileKind uint8
+
+const (
+	kindUpdate fileKind = iota
+	kindCreate
+	kindDelete
+	kindRename
+	kindChmod
 )
 
 // File is one staged update.
@@ -36,18 +48,28 @@ type File struct {
 	// name is Path relative to the transaction root. All filesystem access in
 	// Commit/Rollback goes through the root and this name.
 	name string
+	kind fileKind
+	// newName is the destination for a rename, also root-relative.
+	newName string
+	// trashName is where a deleted file is parked until commit succeeds.
+	trashName string
+	// origMode is the mode restored by a chmod rollback.
+	origMode os.FileMode
 }
 
 // Tx is a set of staged file updates that commit or roll back together.
 type Tx struct {
-	ID      string
-	Root    string
-	root    *os.Root
-	dir     string
-	files   []File
-	applied []File
-	lock    *rootLock
-	tmp     map[string]string // relative name -> staging temp path
+	ID            string
+	Root          string
+	root          *os.Root
+	dir           string
+	files         []File
+	applied       []File
+	lock          *rootLock
+	tmp           map[string]string // relative name -> staging temp path
+	trash         map[string]string // original name -> parked deleted name
+	keepTrash     bool              // rollback failed; keep parked copies for recovery
+	needsRecovery bool              // rollback was incomplete; journal must remain
 }
 
 // New creates a transaction rooted at root. The root is opened with os.Root, so
@@ -82,13 +104,19 @@ func New(root string) (*Tx, error) {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	return &Tx{ID: id, Root: root, root: r, dir: dir, lock: lk, tmp: map[string]string{}}, nil
+	return &Tx{ID: id, Root: root, root: r, dir: dir, lock: lk,
+		tmp: map[string]string{}, trash: map[string]string{}}, nil
 }
 
 // rel returns path relative to the transaction root. It is lexical, but the
 // root check in every filesystem operation rejects anything that escapes (for
 // example through a symlinked parent).
 func (t *Tx) rel(path string) (string, error) {
+	// Resolve relative paths against the transaction root, never the process
+	// working directory: plans and journals address files relative to the root.
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(t.Root, path)
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -142,16 +170,112 @@ func (t *Tx) Stage(path string, before, after []byte, mode os.FileMode) error {
 	if mode == 0 {
 		mode = info.Mode()
 	}
-	t.files = append(t.files, File{Path: path, Before: before, After: after, Mode: mode, name: name})
+	t.files = append(t.files, File{Path: path, Before: before, After: after, Mode: mode, name: name, kind: kindUpdate})
 	return nil
 }
+
+// StageCreate records a new file. The path must not already exist.
+func (t *Tx) StageCreate(path string, after []byte, mode os.FileMode) error {
+	name, err := t.rel(path)
+	if err != nil {
+		return err
+	}
+	if _, err := t.root.Lstat(name); err == nil {
+		return fmt.Errorf("%s already exists; refusing to overwrite it", path)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if mode == 0 {
+		mode = 0o644
+	}
+	t.files = append(t.files, File{Path: path, After: after, Mode: mode, name: name, kind: kindCreate})
+	return nil
+}
+
+// StageDelete records the removal of an existing regular file. before must be
+// the exact content read during planning.
+func (t *Tx) StageDelete(path string, before []byte, mode os.FileMode) error {
+	name, err := t.rel(path)
+	if err != nil {
+		return err
+	}
+	info, err := t.root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || hardlinked(info) {
+		return fmt.Errorf("%s is not a safe regular file to delete", path)
+	}
+	if mode == 0 {
+		mode = info.Mode()
+	}
+	t.files = append(t.files, File{Path: path, Before: before, Mode: mode, name: name, kind: kindDelete})
+	return nil
+}
+
+// StageRename records a rename from one root-relative path to another.
+func (t *Tx) StageRename(from, to string, before []byte, mode os.FileMode) error {
+	fromName, err := t.rel(from)
+	if err != nil {
+		return err
+	}
+	toName, err := t.rel(to)
+	if err != nil {
+		return err
+	}
+	info, err := t.root.Lstat(fromName)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", from, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || hardlinked(info) {
+		return fmt.Errorf("%s is not a safe regular file to rename", from)
+	}
+	if _, err := t.root.Lstat(toName); err == nil {
+		return fmt.Errorf("%s already exists; refusing to overwrite it", to)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", to, err)
+	}
+	if mode == 0 {
+		mode = info.Mode()
+	}
+	t.files = append(t.files, File{Path: from, Before: before, Mode: mode,
+		name: fromName, newName: toName, kind: kindRename})
+	return nil
+}
+
+// StageChmod records a mode change. Content is read so the transaction can
+// detect a concurrent modification, and the original mode is kept for rollback.
+func (t *Tx) StageChmod(path string, mode os.FileMode) error {
+	name, err := t.rel(path)
+	if err != nil {
+		return err
+	}
+	info, err := t.root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || hardlinked(info) {
+		return fmt.Errorf("%s is not a safe regular file to chmod", path)
+	}
+	cur, _, err := t.readRoot(name)
+	if err != nil {
+		return err
+	}
+	t.files = append(t.files, File{Path: path, Before: cur, Mode: mode,
+		name: name, kind: kindChmod, origMode: info.Mode()})
+	return nil
+}
+
+// NeedsRecovery reports whether a rollback was incomplete. Callers must leave
+// the audit journal pending so `aed recover` can finish the job.
+func (t *Tx) NeedsRecovery() bool { return t.needsRecovery }
 
 // Files returns the staged (changed) files.
 func (t *Tx) Files() []File { return append([]File(nil), t.files...) }
 
-// Commit validates every target against its expected original content, stages
-// all new content, then renames every file into place. It is all-or-nothing:
-// any error restores every file already replaced.
+// Commit validates every target, stages new content, then applies each
+// operation. It is all-or-nothing: any error restores every file already
+// changed.
 func (t *Tx) Commit() error {
 	if len(t.files) == 0 {
 		return nil
@@ -160,54 +284,123 @@ func (t *Tx) Commit() error {
 		return fmt.Errorf("transaction is closed")
 	}
 
-	// 1. Validate all targets and write all staging files. Nothing visible has
+	// 1. Preflight: validate targets and stage new content. Nothing visible has
 	// changed yet, so a failure here just removes the staging files.
 	for _, f := range t.files {
-		if err := t.checkUnchanged(f); err != nil {
+		switch f.kind {
+		case kindCreate:
+			if _, err := t.root.Lstat(f.name); err == nil {
+				t.removeTemps()
+				return fmt.Errorf("conflict: %s appeared since the plan was built", f.Path)
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				t.removeTemps()
+				return fmt.Errorf("stat %s: %w", f.Path, err)
+			}
+			tmp, err := t.stageFile(f)
+			if err != nil {
+				t.removeTemps()
+				return err
+			}
+			t.tmp[f.name] = tmp
+		case kindUpdate:
+			if err := t.checkUnchanged(f); err != nil {
+				t.removeTemps()
+				return err
+			}
+			tmp, err := t.stageFile(f)
+			if err != nil {
+				t.removeTemps()
+				return err
+			}
+			t.tmp[f.name] = tmp
+		case kindDelete, kindChmod:
+			if err := t.checkUnchanged(f); err != nil {
+				t.removeTemps()
+				return err
+			}
+		case kindRename:
+			if err := t.checkUnchanged(f); err != nil {
+				t.removeTemps()
+				return err
+			}
+			if _, err := t.root.Lstat(f.newName); err == nil {
+				t.removeTemps()
+				return fmt.Errorf("conflict: %s appeared since the plan was built", f.newName)
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				t.removeTemps()
+				return fmt.Errorf("stat %s: %w", f.newName, err)
+			}
+		default:
 			t.removeTemps()
-			return err
+			return fmt.Errorf("unknown transaction operation")
 		}
-		tmp, err := t.stageFile(f)
-		if err != nil {
-			t.removeTemps()
-			return err
-		}
-		t.tmp[f.name] = tmp
 	}
 
-	// 2. Rename each staged file over its target. The hash is re-checked
-	// immediately before each rename, which is the narrowest window we can
-	// offer without holding a lock on every file. On failure, restore every
-	// target already replaced.
+	// 2. Apply. The hash is re-checked immediately before each change, which is
+	// the narrowest window available without locking every file.
 	for _, f := range t.files {
-		if err := t.checkUnchanged(f); err != nil {
+		var err error
+		switch f.kind {
+		case kindUpdate, kindCreate:
+			if err = t.checkUnchangedOrAbsent(f); err != nil {
+				break
+			}
+			err = t.root.Rename(t.tmp[f.name], f.name)
+			if err == nil {
+				delete(t.tmp, f.name)
+			}
+		case kindDelete:
+			if err = t.checkUnchanged(f); err != nil {
+				break
+			}
+			trash := filepath.Join(filepath.Dir(f.name), randomStagingName())
+			if err = t.root.Rename(f.name, trash); err == nil {
+				f.trashName = trash
+				t.trash[f.name] = trash
+			}
+		case kindRename:
+			if err = t.checkUnchanged(f); err != nil {
+				break
+			}
+			err = t.root.Rename(f.name, f.newName)
+		case kindChmod:
+			if err = t.checkUnchanged(f); err != nil {
+				break
+			}
+			err = t.chmod(f.name, f.Mode)
+		}
+		if err != nil {
 			t.removeTemps()
 			rbErr := t.Rollback()
 			if rbErr != nil {
-				return fmt.Errorf("%w (rollback failed: %v)", err, rbErr)
+				t.needsRecovery = true
+				return fmt.Errorf("%s: %w (rollback failed: %v)", f.Path, err, rbErr)
 			}
-			return err
+			return fmt.Errorf("%s: %w (rolled back)", f.Path, err)
 		}
-		tmp := t.tmp[f.name]
-		if err := t.root.Rename(tmp, f.name); err != nil {
-			t.removeTemps()
-			rbErr := t.Rollback()
-			if rbErr != nil {
-				return fmt.Errorf("replace %s: %w (rollback failed: %v)", f.Path, err, rbErr)
-			}
-			return fmt.Errorf("replace %s: %w (rolled back)", f.Path, err)
-		}
-		delete(t.tmp, f.name)
 		t.applied = append(t.applied, f)
 		t.syncDir(f.name)
 	}
 
-	// 3. Verify the committed bytes. A mismatch is treated as a failed
-	// transaction and restored.
+	// 3. Verify the committed state, then discard parked deleted files.
 	for _, f := range t.applied {
-		if err := t.verifyFile(f.name, f.After); err != nil {
+		var err error
+		switch f.kind {
+		case kindUpdate, kindCreate:
+			err = t.verifyFile(f.name, f.After)
+		case kindDelete:
+			err = t.verifyAbsent(f.name)
+		case kindRename:
+			if err = t.verifyAbsent(f.name); err == nil {
+				err = t.verifyExists(f.newName)
+			}
+		case kindChmod:
+			err = t.verifyMode(f.name, f.Mode)
+		}
+		if err != nil {
 			rbErr := t.Rollback()
 			if rbErr != nil {
+				t.needsRecovery = true
 				return fmt.Errorf("verify %s: %w (rollback failed: %v)", f.Path, err, rbErr)
 			}
 			return fmt.Errorf("verify %s: %w (rolled back)", f.Path, err)
@@ -216,7 +409,7 @@ func (t *Tx) Commit() error {
 	return nil
 }
 
-// Rollback restores every file this transaction replaced. It is safe to call
+// Rollback restores every file this transaction changed. It is safe to call
 // after a successful Commit (used when a post-apply semantic check fails) and
 // after a failed Commit.
 func (t *Tx) Rollback() error {
@@ -226,32 +419,144 @@ func (t *Tx) Rollback() error {
 	var errs []string
 	for i := len(t.applied) - 1; i >= 0; i-- {
 		f := t.applied[i]
-		// If another writer changed the file after our commit, restoring our
-		// original would destroy their work. Refuse and report it instead.
-		cur, _, rerr := t.readRoot(f.name)
-		if rerr != nil || Hash(cur) != Hash(f.After) {
-			errs = append(errs, fmt.Sprintf("%s: changed since apply; refusing to roll back", f.Path))
-			continue
-		}
-		if err := t.atomicWrite(f.name, f.Before, f.Mode); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
-			continue
-		}
-		if err := t.verifyFile(f.name, f.Before); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+		switch f.kind {
+		case kindUpdate:
+			// If another writer changed the file after our commit, restoring
+			// our original would destroy their work. Refuse and report it.
+			cur, _, rerr := t.readRoot(f.name)
+			if rerr != nil || Hash(cur) != Hash(f.After) {
+				errs = append(errs, fmt.Sprintf("%s: changed since apply; refusing to roll back", f.Path))
+				continue
+			}
+			if err := t.atomicWrite(f.name, f.Before, f.Mode); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+				continue
+			}
+			if err := t.verifyFile(f.name, f.Before); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+			}
+		case kindCreate:
+			cur, _, rerr := t.readRoot(f.name)
+			if rerr != nil || Hash(cur) != Hash(f.After) {
+				errs = append(errs, fmt.Sprintf("%s: changed since apply; refusing to remove it", f.Path))
+				continue
+			}
+			if err := t.root.Remove(f.name); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+			}
+		case kindDelete:
+			if f.trashName == "" {
+				errs = append(errs, fmt.Sprintf("%s: deleted file is no longer recoverable", f.Path))
+				continue
+			}
+			if err := t.root.Rename(f.trashName, f.name); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+				continue
+			}
+			if err := t.verifyFile(f.name, f.Before); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+			}
+		case kindRename:
+			if _, err := t.root.Lstat(f.newName); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: renamed file is missing", f.Path))
+				continue
+			}
+			if err := t.root.Rename(f.newName, f.name); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+			}
+		case kindChmod:
+			if err := t.chmod(f.name, f.origMode); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Path, err))
+			}
 		}
 	}
 	if len(errs) > 0 {
+		t.keepTrash = true
+		t.needsRecovery = true
 		return fmt.Errorf("rollback incomplete: %v", errs)
 	}
 	t.applied = nil
+	t.trash = map[string]string{}
 	return nil
+}
+
+// checkUnchangedOrAbsent applies the right existence check for a create/update.
+func (t *Tx) checkUnchangedOrAbsent(f File) error {
+	if f.kind == kindCreate {
+		_, err := t.root.Lstat(f.name)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("conflict: %s appeared since the plan was built", f.Path)
+	}
+	return t.checkUnchanged(f)
+}
+
+// chmod changes a file's mode through an opened descriptor (avoiding the
+// path-race warning on os.Root.Chmod).
+func (t *Tx) chmod(name string, mode os.FileMode) error {
+	f, err := t.root.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Chmod(mode)
+}
+
+func (t *Tx) verifyAbsent(name string) error {
+	if _, err := t.root.Lstat(name); err == nil {
+		return fmt.Errorf("%s still exists", name)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (t *Tx) verifyExists(name string) error {
+	info, err := t.root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", name)
+	}
+	return nil
+}
+
+func (t *Tx) verifyMode(name string, want os.FileMode) error {
+	info, err := t.root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm() != want.Perm() {
+		return fmt.Errorf("mode = %o, want %o", info.Mode().Perm(), want.Perm())
+	}
+	return nil
+}
+
+func (t *Tx) removeTrash() {
+	if t.root == nil {
+		return
+	}
+	for name, trash := range t.trash {
+		_ = t.root.Remove(trash)
+		delete(t.trash, name)
+	}
+	t.trash = map[string]string{}
 }
 
 // Cleanup removes staging files, releases the root lock, and closes the root.
 // It does not change file contents.
 func (t *Tx) Cleanup() {
-	t.removeTemps()
+	if t.root != nil {
+		t.removeTemps()
+		if !t.keepTrash {
+			t.removeTrash()
+		}
+	}
 	if t.lock != nil {
 		t.lock.release()
 		t.lock = nil
@@ -267,6 +572,9 @@ func (t *Tx) Cleanup() {
 }
 
 func (t *Tx) removeTemps() {
+	if t.root == nil {
+		return
+	}
 	for name, tmp := range t.tmp {
 		_ = t.root.Remove(tmp)
 		delete(t.tmp, name)
@@ -318,16 +626,23 @@ func (t *Tx) readRoot(name string) ([]byte, os.FileMode, error) {
 	return data, info.Mode(), err
 }
 
+// randomStagingName returns a random ".aed-..." basename.
+func randomStagingName() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure means the process is in a bad state; use a
+		// timestamp-derived fallback that is still unique enough for staging.
+		return fmt.Sprintf(".aed-%d", time.Now().UnixNano())
+	}
+	return ".aed-" + hex.EncodeToString(b[:])
+}
+
 // stageFile writes content to a random, private temp file in the target's
 // directory (through the root) and returns its root-relative path.
 func (t *Tx) stageFile(f File) (string, error) {
 	dir := filepath.Dir(f.name)
 	for attempt := 0; attempt < 100; attempt++ {
-		var b [12]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", fmt.Errorf("generate staging name: %w", err)
-		}
-		name := filepath.Join(dir, ".aed-"+hex.EncodeToString(b[:]))
+		name := filepath.Join(dir, randomStagingName())
 		tmp, err := t.root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if errors.Is(err, fs.ErrExist) {
 			continue
