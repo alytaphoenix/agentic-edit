@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -85,12 +86,12 @@ func guardFailureArgs(dir string, path string) []string {
 	return []string{"--action", `replace "b" with "ab"`, "-f", path, "-y"}
 }
 
-func TestGuardFailureExits3WithoutRestore(t *testing.T) {
+func TestGuardFailureRollsBackAndExits3(t *testing.T) {
 	dir := t.TempDir()
 	path := writeLine(t, dir, `x = "b"`)
 	orig := `x = "b"`
 
-	// -y: report only, no prompt, file left edited, exit 3.
+	// -y: report only, automatic rollback, exit 3.
 	code, out := runEditStdin(dir, "n", guardFailureArgs(dir, path)...)
 	if code != 3 {
 		t.Fatalf("exit=%d, want 3; out=%q", code, out)
@@ -98,17 +99,27 @@ func TestGuardFailureExits3WithoutRestore(t *testing.T) {
 	if !strings.Contains(out, "verify[FAILED]") {
 		t.Errorf("expected FAILED status, out=%q", out)
 	}
-	if strings.Contains(out, "restored") {
-		t.Errorf("-y must not prompt to restore, out=%q", out)
+	if !strings.Contains(out, "restored original files") {
+		t.Errorf("expected automatic rollback, out=%q", out)
 	}
 	got, _ := os.ReadFile(path)
-	if strings.TrimRight(string(got), "\n") != `x = "ab"` {
-		t.Errorf("expected file edited to x = \"ab\" (no restore), got %q", string(got))
+	if strings.TrimRight(string(got), "\n") != orig {
+		t.Errorf("expected file restored to %q, got %q", orig, string(got))
 	}
 
-	// Reset the file and retry applying without -y but with piped (non-TTY)
-	// stdin: --dry-run=false forces the apply, the confirm reads "y", and the
-	// guard still fails. With no TTY the restore prompt is skipped (report only).
+	// --keep-on-failure preserves the old "leave the edit in place" behavior.
+	code, out = runEditStdin(dir, "y\n", "--action", `replace "b" with "ab"`, "-f", path, "-y", "--keep-on-failure")
+	if code != 3 {
+		t.Fatalf("keep-on-failure exit=%d, want 3; out=%q", code, out)
+	}
+	got, _ = os.ReadFile(path)
+	if strings.TrimRight(string(got), "\n") != `x = "ab"` {
+		t.Errorf("--keep-on-failure should keep the edit, got %q", string(got))
+	}
+
+	// Reset and retry applying without -y but with piped (non-TTY) stdin:
+	// --dry-run=false forces the apply, the confirm reads "y", and the guard
+	// still fails. It rolls back automatically.
 	if err := os.WriteFile(path, []byte(orig+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -116,8 +127,8 @@ func TestGuardFailureExits3WithoutRestore(t *testing.T) {
 	if code != 3 {
 		t.Fatalf("no-y non-interactive exit=%d, want 3; out=%q", code, out)
 	}
-	if strings.Contains(out, "restored") {
-		t.Errorf("piped stdin must not prompt to restore, out=%q", out)
+	if !strings.Contains(out, "restored original files") {
+		t.Errorf("expected automatic rollback, out=%q", out)
 	}
 }
 
@@ -178,4 +189,171 @@ func writeLine(t *testing.T, dir, line string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// The old implementation wrote to predictable "file.aed.tmp" and "file.bak"
+// siblings. Pre-creating those as symlinks must not let an edit write outside
+// the workspace.
+func TestSymlinkSiblingPathsNotFollowed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("x=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(outside, []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{".aed.tmp", ".bak"} {
+		if err := os.Symlink(outside, path+suffix); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out := runEditCmd(dir, "--action", `replace "x=1" with "x=2"`, "-f", path, "-y")
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q", code, out)
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "safe\n" {
+		t.Fatalf("outside file modified: %q", got)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("target became a symlink")
+	}
+	if got, _ := os.ReadFile(path); string(got) != "x=2\n" {
+		t.Fatalf("target content = %q", got)
+	}
+}
+
+func TestSymlinkTargetRefused(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(target, []byte("x=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "x=1" with "x=2"`, "-f", link, "-y")
+	if code == 0 {
+		t.Fatalf("expected symlink target to be refused, out=%q", out)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "x=1\n" {
+		t.Fatalf("symlink target modified: %q", got)
+	}
+}
+
+func TestLiteralReplaceDoesNotActAsRegex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("a.b\naxb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "a.b" with "X"`, "-f", path, "-y")
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q", code, out)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "X\naxb\n" {
+		t.Fatalf("literal replace changed the wrong text: %q", got)
+	}
+}
+
+func TestReplaceRequiresUniqueByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("v1\nv1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y")
+	if code == 0 {
+		t.Fatalf("expected ambiguous replace to fail, out=%q", out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "v1\nv1\n" {
+		t.Fatalf("file was modified despite ambiguity: %q", got)
+	}
+	code, out = runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y", "--all")
+	if code != 0 {
+		t.Fatalf("--all exit=%d out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "v2\nv2\n" {
+		t.Fatalf("--all result = %q", got)
+	}
+}
+
+func TestProtectedPathRequiresOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("TOKEN=v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y")
+	if code != 5 {
+		t.Fatalf("exit=%d, want 5; out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "TOKEN=v1\n" {
+		t.Fatalf("protected file modified: %q", got)
+	}
+	code, out = runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y", "--allow-protected")
+	if code != 0 {
+		t.Fatalf("override exit=%d out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "TOKEN=v2\n" {
+		t.Fatalf("override result = %q", got)
+	}
+}
+
+// A grep-only plan is a search. It must not build a fake "after" that looks
+// like the whole file was deleted.
+func TestGrepPlanIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("axb\nzzz\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `find zzz`, "-f", path, "-y")
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q", code, out)
+	}
+	if strings.Contains(out, "-axb") || strings.Contains(out, "applied:") {
+		t.Fatalf("grep was treated as an edit: %q", out)
+	}
+	if !strings.Contains(out, "zzz") {
+		t.Fatalf("expected the matching line, got %q", out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "axb\nzzz\n" {
+		t.Fatalf("grep-only edit changed the file: %q", got)
+	}
+}
+
+func TestJSONResult(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	code := Run([]string{"edit", "--root", dir, "--action", `replace "v1" with "v2"`, "-f", path, "--json"}, strings.NewReader("n"), &out, &errb)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, errb.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON %q: %v", out.String(), err)
+	}
+	if got["ok"] != true || got["dry_run"] != true {
+		t.Fatalf("unexpected result: %v", got)
+	}
+	files, _ := got["files"].([]any)
+	if len(files) != 1 {
+		t.Fatalf("expected one file, got %v", got["files"])
+	}
 }

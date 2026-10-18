@@ -35,6 +35,12 @@ type Op struct {
 	Scope  string `json:"scope,omitempty"` // "" or "/addr/"
 	Global bool   `json:"global,omitempty"`
 
+	// Replace semantics. Literal is the safe default: X is matched as a plain
+	// string. Set Regex to opt into sed regular-expression matching. ExpectCount
+	// > 0 requires exactly that many matches before the edit is allowed.
+	Regex       bool `json:"regex,omitempty"`
+	ExpectCount int  `json:"expect_count,omitempty"`
+
 	// sed delete / grep find.
 	Pattern string `json:"pattern,omitempty"`
 
@@ -68,6 +74,12 @@ func (o Op) Validate() error {
 	case KindSed:
 		if strings.ContainsAny(o.X, "\r\n") || strings.ContainsAny(o.Y, "\r\n") {
 			return fmt.Errorf("sed replace values must be single-line")
+		}
+		if o.ExpectCount < 0 {
+			return fmt.Errorf("expect_count must not be negative")
+		}
+		if len(o.X) > 64*1024 || len(o.Y) > 64*1024 || len(o.Pattern) > 64*1024 {
+			return fmt.Errorf("sed value exceeds the 64 KiB limit")
 		}
 		if o.SedAction() == "replace" {
 			if o.X == "" {
@@ -110,10 +122,17 @@ func (o Op) Validate() error {
 func (o Op) SedAction() string { return o.sedAction() }
 
 func isAddr(s string) bool {
-	if len(s) < 2 || s[0] != '/' || s[len(s)-1] != '/' {
+	if len(s) < 2 || len(s) > 1024 || s[0] != '/' || s[len(s)-1] != '/' {
 		return false
 	}
-	return !strings.ContainsAny(s, "\r\n")
+	// A sed address is a regex delimited by slashes. Semicolon, braces, bang,
+	// and hash are command separators/control characters in sed; allowing them
+	// inside the "address" let an LLM emit something like "/x/;e id;/y/" and
+	// execute a shell command on GNU sed. Reject them outright.
+	if strings.ContainsAny(s, "\r\n;{}!#") {
+		return false
+	}
+	return true
 }
 
 // Parse turns a natural-language instruction into a list of typed Ops using a
@@ -180,7 +199,9 @@ func ParseOps(txt string) ([]Op, bool) {
 	trimmed = strings.TrimSuffix(trimmed, "```")
 
 	var ops []Op
-	if err := json.Unmarshal([]byte(trimmed), &ops); err != nil || len(ops) == 0 {
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ops); err != nil || len(ops) == 0 || len(ops) > 100 {
 		return nil, false
 	}
 	for _, o := range ops {

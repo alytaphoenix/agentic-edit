@@ -146,3 +146,31 @@ func TestRenderInvalidAddress(t *testing.T) {
 		t.Fatal("expected error for invalid address")
 	}
 }
+
+func TestRenderRejectsAddressInjection(t *testing.T) {
+	for _, scope := range []string{
+		"/x/;e id;/y/",
+		"/x/;w /tmp/pwned;/y/",
+		"/x/!d;/y/",
+		"/x/{s/a/b/};/y/",
+	} {
+		op := intent.Op{Kind: intent.KindSed, X: "a", Y: "b", Scope: scope}
+		if _, err := Render(op, false); err == nil {
+			t.Errorf("accepted sed address injection %q", scope)
+		}
+	}
+}
+
+func TestRenderLiteralEscapesRegexMetacharacters(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, X: "a.b", Y: "X", Global: true}
+	eo, err := Render(op, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eo.Script != `s|a\.b|X|g` {
+		t.Fatalf("literal script = %q, want s|a\\.b|X|g", eo.Script)
+	}
+	if !eo.Literal {
+		t.Fatal("expected Literal=true")
+	}
+}

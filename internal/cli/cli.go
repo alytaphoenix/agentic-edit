@@ -6,20 +6,24 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"agentic-edit/internal/exec"
 	"agentic-edit/internal/gen"
 	"agentic-edit/internal/lang"
 	"agentic-edit/internal/laya"
+	"agentic-edit/internal/layasafety"
 	"agentic-edit/internal/plan"
 	"agentic-edit/internal/safety"
 	"agentic-edit/internal/scrub"
+	"agentic-edit/internal/tx"
 	"agentic-edit/internal/verify"
 )
 
@@ -27,22 +31,39 @@ import (
 // look binary) are rejected up front.
 const maxFileBytes = 50 * 1024 * 1024
 
+// Version is the CLI version reported by `aed version`.
+const Version = "0.2.0"
+
 const usageText = `aed — agentic file editing with awk/sed/grep + Laya
 
 Usage:
   aed edit   -a "instruction" -f FILE [-f FILE...] [options]
-  aed grep   [-E] [-c] PATTERN [FILE...]
+  aed check  [-json] FILE [FILE...]
+  aed grep   [-E] [-c] [--json] PATTERN [FILE...]
+  aed list-laya-tools [--laya-url URL] [--laya-token TOKEN]
+  aed version
+  aed help
 
 edit options:
   -f, --file       Target file (repeatable) [required]
   -a, --action     Natural-language instruction [required]
   --dry-run        Preview only. Default: on (preview). Use -y to apply.
-  -y, --yes        Apply without confirmation
+  -y, --yes        Apply without confirmation (alias: --apply)
   --verify         Verify after applying (grep asserts + optional Laya review)
                    (default: on; use --no-verify to disable the post-apply guard)
-  --llm            Use an LLM (Laya/Ollama/OpenAI) to plan the edit (opt-in)
+  --check          Syntax-check edited files before applying (default: on)
+  --no-check       Skip the pre-apply syntax check
+  --unique         Require exactly one match for each replace (default)
+  --all            Allow a replace to match more than once
+  --keep-on-failure  Keep the edited file if verification fails (default: roll back)
+  --json           Emit one machine-readable JSON result on stdout
+  --llm            Use an Ollama/OpenAI-compatible model to plan the edit (opt-in)
   --no-llm         Skip LLM; use the deterministic generator only
+  --laya-safety    Edit-risk review: off, warn, or block (default: off)
+  --laya-safety-model  Laya checkpoint/model name (default: server auto)
+  --laya-safety-threshold  Review below this confidence (default: 0.65)
   --show-secrets   Do not redact secrets from LLM prompts and output (alias: --no-scrub)
+  --allow-protected  Allow editing protected paths (.git, CI, keys, .env, ...)
   --force          Allow whole-file destructive deletes (e.g. delete matching .)
   --root           Workspace root for path confinement (default: current dir)
   --laya-url       Laya MCP URL (default http://127.0.0.1:8420/mcp/)
@@ -69,6 +90,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runGrep(args[1:], stdout, stderr)
 	case "list-laya-tools":
 		return listLayaTools(args[1:], stdout, stderr)
+	case "version", "--version":
+		fmt.Fprintf(stdout, "aed %s\n", Version)
+		return 0
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usageText)
 		return 0
@@ -79,7 +103,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 }
 
-func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
 	var files stringList
 	fs.Var(&files, "f", "target file (repeatable)")
@@ -89,12 +113,16 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	dry := fs.Bool("dry-run", true, "preview only")
 	yes := fs.Bool("y", false, "apply without confirmation")
 	fs.BoolVar(yes, "yes", false, "apply without confirmation")
+	fs.BoolVar(yes, "apply", false, "apply without confirmation (alias for -y)")
 	verifyOn := fs.Bool("verify", true, "verify after applying (default on)")
 	noVerify := fs.Bool("no-verify", false, "do not verify after applying")
-	checkOn := fs.Bool("check", true, "syntax-check edited files with their own language checker (bash, python) before applying")
+	checkOn := fs.Bool("check", true, "syntax-check edited files with their own language checker before applying")
 	noCheck := fs.Bool("no-check", false, "skip the pre-apply syntax check; a syntax regression exits 4")
 	llmOn := fs.Bool("llm", false, "use an LLM to plan the edit")
 	noLLM := fs.Bool("no-llm", false, "skip LLM; deterministic only")
+	safetyMode := fs.String("laya-safety", "off", "Laya edit-risk review: off, warn, block")
+	safetyModel := fs.String("laya-safety-model", "", "Laya checkpoint/model name")
+	safetyThreshold := fs.Float64("laya-safety-threshold", 0.65, "review below this confidence")
 	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets from LLM prompts and output")
 	fs.BoolVar(showSecrets, "no-scrub", false, "alias for --show-secrets")
 	force := fs.Bool("force", false, "allow whole-file destructive deletes")
@@ -106,27 +134,55 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	apiKey := fs.String("api-key", os.Getenv("OPENAI_API_KEY"), "OpenAI-compatible key")
 	baseURL := fs.String("base-url", "https://api.openai.com/v1", "OpenAI-compatible base URL")
 	egress := fs.String("egress", "", "optional Laya outbound action (opt-in)")
+	jsonOut := fs.Bool("json", false, "emit one JSON result on stdout")
+	unique := fs.Bool("unique", true, "require exactly one match for each replace")
+	all := fs.Bool("all", false, "allow a replace to match more than once")
+	allowProtected := fs.Bool("allow-protected", false, "allow editing protected paths")
+	keepOnFailure := fs.Bool("keep-on-failure", false, "keep the edit if verification fails")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	jsonMode := *jsonOut
+	humanOut := stdout
+	if jsonMode {
+		humanOut = stderr
+	}
+	res := editResult{Version: 1, DryRun: *dry}
+	defer func() {
+		if !jsonMode {
+			return
+		}
+		res.OK = code == 0
+		if code != 0 && res.Error == nil {
+			res.Error = &editError{Code: code, Message: exitMessage(code)}
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(res)
+	}()
+
 	if *action == "" {
 		fmt.Fprintln(stderr, "error: --action is required")
+		res.Error = &editError{Code: 2, Message: "--action is required"}
 		return 2
 	}
 	if len(files) == 0 {
 		fmt.Fprintln(stderr, "error: at least one -f FILE is required")
+		res.Error = &editError{Code: 2, Message: "at least one -f FILE is required"}
 		return 2
 	}
 
 	useLLM := *llmOn && !*noLLM
 	forceDeletes := *force
+	requireUnique := *unique && !*all
 	root := *rootFlag
 	if root == "" {
 		if wd, err := os.Getwd(); err == nil {
 			root = wd
 		}
 	}
+	rootForRel, _ := filepath.Abs(root)
 
 	// scrubFn redacts secrets from LLM prompts and stdout unless --show-secrets.
 	var scrubFn func(string) string
@@ -140,29 +196,40 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// workspace root, size-checked, and rejected if they look binary.
 	confined := make([]string, 0, len(files))
 	contents := map[string]string{}
-	origStat := map[string]os.FileInfo{}
+	origMode := map[string]os.FileMode{}
+	origHash := map[string]string{}
 	for _, f := range files {
 		real, err := confine(f, root)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
+			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
-		data, err := os.ReadFile(real)
+		rootForRel, _ := filepath.Abs(root)
+		rootForRel, _ = filepath.Abs(root)
+		if rel, err := filepath.Rel(rootForRel, real); err == nil && isProtected(rel) && !*allowProtected {
+			msg := fmt.Sprintf("%q is a protected path; re-run with --allow-protected to edit it", f)
+			fmt.Fprintf(stderr, "policy: %s\n", msg)
+			res.Error = &editError{Code: 5, Message: msg}
+			return 5
+		}
+		data, mode, err := tx.ReadFile(real)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", real, err)
+			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
 		if err := checkText(real, data); err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
+			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
+		}
+		if _, seen := contents[real]; seen {
+			continue
 		}
 		contents[real] = string(data)
-		info, err := os.Stat(real)
-		if err != nil {
-			fmt.Fprintf(stderr, "error: cannot stat %s: %v\n", real, err)
-			return 1
-		}
-		origStat[real] = info
+		origMode[real] = mode
+		origHash[real] = tx.Hash(data)
 		confined = append(confined, real)
 	}
 	defer exec.Cleanup()
@@ -172,13 +239,13 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	client := laya.New(*layaURL, *layaToken)
 	var layaCtx string
 	if useLLM {
-		layaCtx = plan.Enrich(context.Background(), client, intent)
+		layaCtx = plan.Enrich(context.Background(), client, intent, scrubFn)
 		if layaCtx != "" {
-			fmt.Fprintf(stdout, "[context] %s\n", scrubFn(layaCtx))
+			fmt.Fprintf(humanOut, "[context] %s\n", scrubFn(layaCtx))
 		}
 	}
 
-	res, err := gen.Generate(gen.Input{
+	generated, err := gen.Generate(gen.Input{
 		Intent:      intent,
 		Contents:    contents,
 		LayaContext: layaCtx,
@@ -193,26 +260,74 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
+		res.Error = &editError{Code: 1, Message: err.Error()}
 		return 1
 	}
+	res.Reason = generated.Reason
 
-	for _, op := range res.Ops {
+	for _, op := range generated.Ops {
 		if err := safety.Validate(op); err != nil {
 			fmt.Fprintf(stderr, "safety: %v\n", err)
+			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
+	}
+
+	// Default to a unique literal replace: an agent asking to change "one
+	// thing" must not silently rewrite every occurrence. --all opts out.
+	for i := range generated.Ops {
+		op := &generated.Ops[i]
+		if op.Kind == exec.KindSed && op.Old != "" && op.Literal && requireUnique && op.ExpectCount == 0 {
+			op.ExpectCount = 1
+		}
+	}
+
+	// A grep-only plan is a search, not an edit. Never feed grep output into
+	// "after": doing so used to make the preview look like the file was deleted.
+	mutating := 0
+	for _, op := range generated.Ops {
+		if op.Kind != exec.KindGrep {
+			mutating++
+		}
+	}
+	if mutating == 0 {
+		matches := 0
+		for _, op := range generated.Ops {
+			if op.Kind != exec.KindGrep {
+				continue
+			}
+			lines, err := exec.Search(op.Pattern, confined, false)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				res.Error = &editError{Code: 1, Message: err.Error()}
+				return 1
+			}
+			for _, l := range lines {
+				matches++
+				res.Matches = append(res.Matches, matchResult{File: l.File, Line: l.Num, Text: scrubFn(l.Text)})
+				fmt.Fprintf(humanOut, "%s:%d:%s\n", l.File, l.Num, scrubFn(l.Text))
+			}
+		}
+		if matches == 0 {
+			fmt.Fprintln(humanOut, "(no matches)")
+		}
+		return 0
 	}
 
 	after := map[string]string{}
 	for f, content := range contents {
 		out := content
-		for _, op := range res.Ops {
+		for _, op := range generated.Ops {
+			if op.Kind == exec.KindGrep {
+				continue
+			}
 			if op.Path != "" && op.Path != f {
 				continue
 			}
 			o, err := exec.DryRun(op, out)
 			if err != nil {
 				fmt.Fprintf(stderr, "error: %s failed: %v\n", f, err)
+				res.Error = &editError{Code: 1, Message: err.Error()}
 				return 1
 			}
 			out = o
@@ -220,12 +335,27 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		after[f] = out
 	}
 
+	changedFiles := 0
 	for _, f := range confined {
 		d := exec.LineDiff(contents[f], after[f])
-		if !hasDiff(d) {
-			fmt.Fprintf(stdout, "  (no change to %s)\n", f)
+		changed := hasDiff(d)
+		if changed {
+			changedFiles++
+		}
+		added, removed := diffStats(d)
+		res.Files = append(res.Files, editFile{
+			Path:      f,
+			BeforeSHA: origHash[f],
+			AfterSHA:  tx.Hash([]byte(after[f])),
+			Changed:   changed,
+			Added:     added,
+			Removed:   removed,
+			Diff:      scrubFn(d),
+		})
+		if !changed {
+			fmt.Fprintf(humanOut, "  (no change to %s)\n", f)
 		} else {
-			fmt.Fprintf(stdout, "--- %s\n%s", f, scrubFn(d))
+			fmt.Fprintf(humanOut, "--- %s\n%s", f, scrubFn(d))
 		}
 	}
 
@@ -237,88 +367,214 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		reports := lang.CheckEdits(context.Background(), contents, after)
 		failures, passed := 0, 0
 		for _, r := range reports {
+			sr := syntaxResult{Path: r.Path, Lang: r.Lang, Status: r.Status.String(), Reason: r.Reason}
+			for _, d := range r.Diags {
+				sr.Diagnostics = append(sr.Diagnostics, scrubFn(d.String()))
+			}
+			res.Syntax = append(res.Syntax, sr)
 			switch r.Status {
 			case lang.Failed:
 				failures++
 				for _, d := range r.Diags {
-					fmt.Fprintln(stdout, scrubFn(d.String()))
+					fmt.Fprintln(humanOut, scrubFn(d.String()))
 				}
 			case lang.Passed:
 				passed++
 			case lang.Skipped:
 				if r.Lang != "" {
-					fmt.Fprintf(stdout, "syntax[skip]: %s\n", r.Reason)
+					fmt.Fprintf(humanOut, "syntax[skip]: %s\n", r.Reason)
 				}
 			}
 		}
 		if failures > 0 {
-			fmt.Fprintln(stdout, "syntax[FAILED]: the edit would leave invalid syntax; nothing was applied (--no-check to override)")
+			msg := "the edit would leave invalid syntax; nothing was applied (--no-check to override)"
+			fmt.Fprintf(humanOut, "syntax[FAILED]: %s\n", msg)
+			res.Error = &editError{Code: 4, Message: msg}
 			return 4
 		}
 		if passed > 0 {
-			fmt.Fprintf(stdout, "syntax[ok]: %d file(s) parse cleanly\n", passed)
+			fmt.Fprintf(humanOut, "syntax[ok]: %d file(s) parse cleanly\n", passed)
+		}
+	}
+
+	// Optional Laya edit-risk review. Deterministic gates above remain
+	// authoritative; Laya can only escalate, never grant permission.
+	sMode := layasafety.Mode(strings.ToLower(strings.TrimSpace(*safetyMode)))
+	if sMode != layasafety.Off {
+		if sMode != layasafety.Warn && sMode != layasafety.Block {
+			msg := fmt.Sprintf("invalid --laya-safety %q (want off, warn, or block)", *safetyMode)
+			fmt.Fprintln(stderr, "error: "+msg)
+			res.Error = &editError{Code: 2, Message: msg}
+			return 2
+		}
+		if !client.Configured() {
+			msg := "laya safety requested but --laya-token/--laya-url is not configured"
+			fmt.Fprintln(humanOut, "laya-safety[unavailable]: "+msg)
+			res.Safety = append(res.Safety, safetyResult{Status: "unavailable", Reason: msg})
+			if sMode == layasafety.Block {
+				res.Error = &editError{Code: 8, Message: msg}
+				return 8
+			}
+		} else {
+			for _, f := range confined {
+				if after[f] == contents[f] {
+					continue
+				}
+				d := exec.LineDiff(contents[f], after[f])
+				added, removed := diffStats(d)
+				relForFlags, _ := filepath.Rel(rootForRel, f)
+				state := map[string]any{
+					"instruction": scrubFn(intent.Description),
+					"path":        f,
+					"diff":        scrubFn(d),
+					"stats":       fmt.Sprintf("+%d -%d", added, removed),
+					"flags":       fmt.Sprintf("syntax=checked; protected=%t", isProtected(relForFlags)),
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				v, err := layasafety.Check(ctx, client, state, layasafety.Options{
+					Model:      *safetyModel,
+					BlockBelow: *safetyThreshold,
+				})
+				cancel()
+				sr := safetyResult{Path: f, Status: v.Risk, Confidence: v.Confidence, Reason: v.Reason}
+				if err != nil {
+					sr.Status = "unavailable"
+					sr.Reason = err.Error()
+				}
+				res.Safety = append(res.Safety, sr)
+				switch {
+				case err != nil:
+					fmt.Fprintf(humanOut, "laya-safety[unavailable] %s: %v\n", f, err)
+					if sMode == layasafety.Block {
+						res.Error = &editError{Code: 8, Message: err.Error()}
+						return 8
+					}
+				case v.Risk == "block":
+					msg := fmt.Sprintf("%s: %s (confidence %.2f)", f, v.Reason, v.Confidence)
+					fmt.Fprintln(humanOut, "laya-safety[BLOCK]: "+msg)
+					if sMode == layasafety.Block {
+						res.Error = &editError{Code: 5, Message: msg}
+						return 5
+					}
+				case v.Risk == "review":
+					fmt.Fprintf(humanOut, "laya-safety[review] %s: %s (confidence %.2f)\n", f, v.Reason, v.Confidence)
+				default:
+					fmt.Fprintf(humanOut, "laya-safety[ok] %s (confidence %.2f)\n", f, v.Confidence)
+				}
+			}
 		}
 	}
 
 	apply := *yes || !*dry
+	res.DryRun = !apply
+	if changedFiles == 0 {
+		fmt.Fprintln(humanOut, "\n(no changes)")
+		return 0
+	}
 	if !apply {
-		fmt.Fprintln(stdout, "\n[dry-run] preview only; no files modified. Re-run with -y to apply.")
+		fmt.Fprintln(humanOut, "\n[dry-run] preview only; no files modified. Re-run with -y to apply.")
 		return 0
 	}
 
-	// Stale-edit guard: abort if any target changed since the preview.
+	// Stale-edit guard: abort if any target's bytes changed since the preview.
+	// The transaction repeats this check immediately before each rename.
 	for _, f := range confined {
-		newInfo, err := os.Stat(f)
+		if after[f] == contents[f] {
+			continue
+		}
+		cur, _, err := tx.ReadFile(f)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %q no longer accessible: %v\n", f, err)
+			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
-		old := origStat[f]
-		if old != nil && (old.ModTime().UnixNano() != newInfo.ModTime().UnixNano() || old.Size() != newInfo.Size()) {
-			fmt.Fprintf(stderr, "error: %q changed since preview; aborting\n", f)
-			return 1
+		if tx.Hash(cur) != origHash[f] {
+			msg := fmt.Sprintf("%q changed since preview; aborting", f)
+			fmt.Fprintln(stderr, "conflict: "+msg)
+			res.Error = &editError{Code: 6, Message: msg}
+			return 6
 		}
 	}
 
-	if !*yes && !confirm(stdin, stdout) {
-		fmt.Fprintln(stdout, "aborted")
+	if !*yes && !confirm(stdin, humanOut) {
+		fmt.Fprintln(humanOut, "aborted")
 		return 0
 	}
 
-	for _, op := range res.Ops {
-		for _, f := range confined {
-			if op.Path != "" && op.Path != f {
-				continue
-			}
-			target := op
-			target.Path = f
-			if err := exec.RunInPlace(target); err != nil {
-				fmt.Fprintf(stderr, "error applying %s: %v\n", f, err)
-				return 1
-			}
+	t, err := tx.New(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		res.Error = &editError{Code: 6, Message: err.Error()}
+		return 6
+	}
+	defer t.Cleanup()
+	for _, f := range confined {
+		if after[f] == contents[f] {
+			continue
 		}
-		fmt.Fprintf(stdout, "applied: %s\n", scrubFn(op.Purpose))
+		if err := t.Stage(f, []byte(contents[f]), []byte(after[f]), origMode[f]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			res.Error = &editError{Code: 1, Message: err.Error()}
+			return 1
+		}
+	}
+	if err := t.Commit(); err != nil {
+		code := 1
+		if strings.Contains(err.Error(), "conflict") {
+			code = 6
+		}
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		res.Error = &editError{Code: code, Message: err.Error()}
+		return code
+	}
+	res.Applied = true
+	res.TXID = t.ID
+	for _, op := range generated.Ops {
+		if op.Kind == exec.KindGrep {
+			continue
+		}
+		fmt.Fprintf(humanOut, "applied: %s\n", scrubFn(op.Purpose))
+	}
+
+	// Verify the exact bytes landed before running the semantic guard.
+	for _, f := range confined {
+		if after[f] == contents[f] {
+			continue
+		}
+		data, _, err := tx.ReadFile(f)
+		if err != nil || tx.Hash(data) != tx.Hash([]byte(after[f])) {
+			msg := fmt.Sprintf("hash verification failed for %s", f)
+			fmt.Fprintln(humanOut, "verify[FAILED]: "+msg)
+			if rbErr := t.Rollback(); rbErr != nil {
+				fmt.Fprintf(stderr, "rollback failed: %v\n", rbErr)
+			} else if !*keepOnFailure {
+				fmt.Fprintln(humanOut, "restored original files")
+			}
+			res.Error = &editError{Code: 3, Message: msg}
+			return 3
+		}
 	}
 
 	if *verifyOn && !*noVerify {
-		res2 := verify.Run(res, contents, after, client, useLLM, scrubFn)
-		if res2.OK {
-			fmt.Fprintf(stdout, "verify[ok]: %s\n", strings.Join(res2.Notes, " | "))
+		vr := verify.Run(generated, contents, after, client, useLLM, scrubFn)
+		res.Verify = vr.Notes
+		if vr.OK {
+			fmt.Fprintf(humanOut, "verify[ok]: %s\n", strings.Join(vr.Notes, " | "))
 		} else {
-			// The edit did not land. Report it with an error diff, then ask
-			// (interactive shells only) whether to restore the originals.
-			fmt.Fprintln(stdout, "verify[FAILED]: the edit did not land as expected")
-			for _, n := range res2.Notes {
-				fmt.Fprintf(stdout, "  %s\n", n)
+			msg := "the edit did not land as expected"
+			fmt.Fprintln(humanOut, "verify[FAILED]: "+msg)
+			for _, n := range vr.Notes {
+				fmt.Fprintf(humanOut, "  %s\n", n)
 			}
-			if !*yes && isTerminal(stdin) {
-				if confirmRestore(stdin, stdout) {
-					for _, f := range confined {
-						exec.Rollback(f)
-					}
-					fmt.Fprintln(stdout, "restored original files from backup")
-				}
+			if *keepOnFailure {
+				fmt.Fprintln(humanOut, "keeping edited files (--keep-on-failure)")
+			} else if rbErr := t.Rollback(); rbErr != nil {
+				fmt.Fprintf(stderr, "rollback failed: %v\n", rbErr)
+			} else {
+				res.Applied = false
+				fmt.Fprintln(humanOut, "restored original files")
 			}
+			res.Error = &editError{Code: 3, Message: msg}
 			return 3
 		}
 	}
@@ -327,7 +583,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if txt, err := client.CallTool(context.Background(), *egress, map[string]any{"description": intent.Description}); err != nil {
 			fmt.Fprintf(stderr, "egress skipped: %v\n", err)
 		} else {
-			fmt.Fprintf(stdout, "egress[%s]: %s\n", *egress, scrubFn(txt))
+			fmt.Fprintf(humanOut, "egress[%s]: %s\n", *egress, scrubFn(txt))
 		}
 	}
 	return 0
@@ -337,6 +593,7 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("grep", flag.ContinueOnError)
 	ext := fs.Bool("E", false, "extended regex")
 	count := fs.Bool("c", false, "count matches")
+	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -347,15 +604,23 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 	}
 	pattern := rest[0]
 	files := rest[1:]
-	if len(files) == 0 {
-		files = []string{"."}
-	}
+	recursive := len(files) == 0
 
 	if *count {
-		n, err := exec.Count(pattern, files, *ext)
+		var n map[string]int
+		var err error
+		if recursive {
+			n, err = exec.CountRecursive(pattern, ".", *ext)
+		} else {
+			n, err = exec.Count(pattern, files, *ext)
+		}
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
+		}
+		if *jsonOut {
+			_ = json.NewEncoder(stdout).Encode(map[string]any{"counts": n})
+			return 0
 		}
 		for f, c := range n {
 			fmt.Fprintf(stdout, "%d\t%s\n", c, f)
@@ -363,10 +628,20 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	lines, err := exec.Search(pattern, files, *ext)
+	var lines []exec.Line
+	var err error
+	if recursive {
+		lines, err = exec.SearchRecursive(pattern, ".", *ext)
+	} else {
+		lines, err = exec.Search(pattern, files, *ext)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(map[string]any{"matches": lines})
+		return 0
 	}
 	for _, l := range lines {
 		fmt.Fprintf(stdout, "%s:%d:%s\n", l.File, l.Num, l.Text)
@@ -376,15 +651,25 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 
 func runCheck(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	paths := fs.Args()
 	if len(paths) == 0 {
-		fmt.Fprintln(stderr, "usage: aed check FILE...")
+		fmt.Fprintln(stderr, "usage: aed check [-json] FILE...")
 		return 2
 	}
 	defer exec.Cleanup()
+
+	type checkResult struct {
+		Path        string   `json:"path"`
+		Lang        string   `json:"lang,omitempty"`
+		Status      string   `json:"status"`
+		Reason      string   `json:"reason,omitempty"`
+		Diagnostics []string `json:"diagnostics,omitempty"`
+	}
+	var results []checkResult
 
 	problems := 0
 	for _, p := range paths {
@@ -393,7 +678,7 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
-		data, err := os.ReadFile(abs)
+		data, _, err := tx.ReadFile(abs)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", p, err)
 			return 1
@@ -403,21 +688,38 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		rep := lang.Check(context.Background(), abs, string(data))
+		cr := checkResult{Path: p, Lang: rep.Lang, Status: rep.Status.String(), Reason: rep.Reason}
 		switch rep.Status {
 		case lang.Failed:
 			problems++
 			for _, d := range rep.Diags {
-				fmt.Fprintln(stdout, scrub.Redact(d.String()))
+				cr.Diagnostics = append(cr.Diagnostics, scrub.Redact(d.String()))
 			}
 		case lang.Passed:
-			fmt.Fprintf(stdout, "%s: ok (%s)\n", p, rep.Lang)
+			cr.Status = "passed"
 		case lang.Skipped:
-			if rep.Lang != "" {
-				fmt.Fprintf(stdout, "%s: skipped (%s)\n", p, rep.Reason)
-			} else {
-				fmt.Fprintf(stdout, "%s: skipped (no checker for this file type)\n", p)
+			cr.Status = "skipped"
+		}
+		results = append(results, cr)
+		if !*jsonOut {
+			switch rep.Status {
+			case lang.Failed:
+				for _, d := range rep.Diags {
+					fmt.Fprintln(stdout, scrub.Redact(d.String()))
+				}
+			case lang.Passed:
+				fmt.Fprintf(stdout, "%s: ok (%s)\n", p, rep.Lang)
+			case lang.Skipped:
+				if rep.Lang != "" {
+					fmt.Fprintf(stdout, "%s: skipped (%s)\n", p, rep.Reason)
+				} else {
+					fmt.Fprintf(stdout, "%s: skipped (no checker for this file type)\n", p)
+				}
 			}
 		}
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(map[string]any{"ok": problems == 0, "files": results})
 	}
 	if problems > 0 {
 		return 4
@@ -433,8 +735,8 @@ func listLayaTools(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	c := laya.New(*url, *token)
-	if !c.Enabled() {
-		fmt.Fprintln(stderr, "error: --laya-token is required")
+	if !c.Configured() {
+		fmt.Fprintln(stderr, "error: --laya-url is required")
 		return 2
 	}
 	tools, err := c.ListTools(context.Background())
@@ -455,13 +757,23 @@ func confine(path, root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Refuse to edit a path whose final component is a symlink. Resolving it
+	// would silently edit a different file; --follow-symlinks is intentionally
+	// not offered in this version.
+	if info, err := os.Lstat(abs); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%q is a symlink; refusing to edit it", path)
+	}
 	real := abs
 	if _, err := os.Stat(abs); err == nil {
 		if r, err := filepath.EvalSymlinks(abs); err == nil {
 			real = r
 		}
 	}
-	rootReal, err := filepath.EvalSymlinks(root)
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
 	if err != nil {
 		return "", fmt.Errorf("workspace root %q is not accessible: %v", root, err)
 	}
@@ -488,12 +800,134 @@ func checkText(name string, data []byte) error {
 	return nil
 }
 
+// editResult is the stable machine-readable result emitted by --json.
+type editResult struct {
+	Version int            `json:"version"`
+	OK      bool           `json:"ok"`
+	Applied bool           `json:"applied"`
+	DryRun  bool           `json:"dry_run"`
+	TXID    string         `json:"tx_id,omitempty"`
+	Reason  string         `json:"reason,omitempty"`
+	Files   []editFile     `json:"files,omitempty"`
+	Matches []matchResult  `json:"matches,omitempty"`
+	Syntax  []syntaxResult `json:"syntax,omitempty"`
+	Safety  []safetyResult `json:"safety,omitempty"`
+	Verify  []string       `json:"verify,omitempty"`
+	Error   *editError     `json:"error,omitempty"`
+}
+
+type editFile struct {
+	Path      string `json:"path"`
+	BeforeSHA string `json:"before_sha256"`
+	AfterSHA  string `json:"after_sha256"`
+	Changed   bool   `json:"changed"`
+	Added     int    `json:"added"`
+	Removed   int    `json:"removed"`
+	Diff      string `json:"diff,omitempty"`
+}
+
+type matchResult struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+	Text string `json:"text"`
+}
+
+type syntaxResult struct {
+	Path        string   `json:"path"`
+	Lang        string   `json:"lang,omitempty"`
+	Status      string   `json:"status"`
+	Reason      string   `json:"reason,omitempty"`
+	Diagnostics []string `json:"diagnostics,omitempty"`
+}
+
+type safetyResult struct {
+	Path       string  `json:"path,omitempty"`
+	Status     string  `json:"status"`
+	Confidence float64 `json:"confidence,omitempty"`
+	Reason     string  `json:"reason,omitempty"`
+}
+
+type editError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
 // hasDiff reports whether a LineDiff output contains any removed/added lines.
 func hasDiff(d string) bool {
 	for _, line := range strings.Split(d, "\n") {
 		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "+") {
 			return true
 		}
+	}
+	return false
+}
+
+// diffStats counts added and removed lines in an aed LineDiff.
+func diffStats(d string) (added, removed int) {
+	for _, line := range strings.Split(d, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+"):
+			added++
+		case strings.HasPrefix(line, "-"):
+			removed++
+		}
+	}
+	return added, removed
+}
+
+func exitMessage(code int) string {
+	switch code {
+	case 1:
+		return "runtime error"
+	case 2:
+		return "usage error"
+	case 3:
+		return "verification failed"
+	case 4:
+		return "syntax gate failed"
+	case 5:
+		return "policy denied"
+	case 6:
+		return "conflict or lock failure"
+	case 8:
+		return "safety checker unavailable"
+	default:
+		return "edit failed"
+	}
+}
+
+// isProtected reports whether rel (relative to the workspace root) is a path
+// whose modification commonly leads to code execution or credential exposure.
+// The list is deliberately conservative and can be overridden explicitly with
+// --allow-protected (which is recorded in the audit log in a future release).
+func isProtected(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	base := filepath.Base(rel)
+	for _, p := range []string{".git/", ".hg/", ".svn/", ".ssh/", ".github/workflows/", ".config/git/"} {
+		if rel == strings.TrimSuffix(p, "/") || strings.HasPrefix(rel, p) {
+			return true
+		}
+	}
+	for _, name := range []string{
+		".env", ".npmrc", ".pypirc", ".netrc", ".bashrc", ".zshrc",
+		".profile", ".bash_profile", ".zprofile", "Jenkinsfile",
+		"Makefile", "GNUmakefile", "Dockerfile", "docker-compose.yml",
+		"docker-compose.yaml", ".gitlab-ci.yml",
+	} {
+		if base == name {
+			return true
+		}
+	}
+	if strings.HasPrefix(base, ".env.") ||
+		strings.HasPrefix(base, "id_rsa") ||
+		strings.HasPrefix(base, "id_ed25519") ||
+		strings.HasPrefix(base, "credentials") ||
+		strings.HasPrefix(base, "secrets") ||
+		strings.HasSuffix(base, ".pem") ||
+		strings.HasSuffix(base, ".key") ||
+		strings.HasSuffix(base, ".mk") ||
+		strings.HasPrefix(base, "docker-compose.") {
+		return true
 	}
 	return false
 }

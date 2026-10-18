@@ -9,6 +9,7 @@ package gen
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"agentic-edit/internal/compile"
@@ -104,12 +105,18 @@ func genPrompt(in Input) string {
 	if scrub == nil {
 		scrub = func(s string) string { return s }
 	}
-	fmt.Fprintf(&b, "Instruction: %s\n", in.Intent.Description)
+	fmt.Fprintf(&b, "Instruction: %s\n", scrub(in.Intent.Description))
 	if in.LayaContext != "" {
 		fmt.Fprintf(&b, "\nBackground context from Laya:\n%s\n", scrub(in.LayaContext))
 	}
 	b.WriteString("\nTarget file contents (first 4000 chars each):\n")
-	for path, content := range in.Contents {
+	paths := make([]string, 0, len(in.Contents))
+	for path := range in.Contents {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		content := in.Contents[path]
 		if len(content) > 4000 {
 			content = content[:4000] + "\n...[truncated]..."
 		}
@@ -118,11 +125,12 @@ func genPrompt(in Input) string {
 	}
 	b.WriteString("\nAny text containing the marker [REDACTED] has been redacted for security; do not attempt to match or replace it.\n")
 	b.WriteString(`Respond with ONLY a JSON array (no markdown fences) of typed edit operations. Each object uses one of these shapes:
-{"kind":"sed","x":"<old>","y":"<new>"}
+{"kind":"sed","x":"<old literal>","y":"<new>","expect_count":1}
+{"kind":"sed","x":"<old regex>","y":"<new>","regex":true,"expect_count":1}
 {"kind":"sed","pattern":"<regex>"}
 {"kind":"sed","anchor":"<regex>","text":"<insert>","insert_before":true|false}
 {"kind":"awk","transform":"upper|lower"}
 {"kind":"grep","pattern":"<regex>"}
-Rules: keep operations targeted; never emit rm, whole-file deletes, or system() calls. If no edit is needed, return [].`)
+Rules: prefer literal x values and expect_count=1. Keep operations targeted; never emit rm, whole-file deletes, scope addresses, paths, or system() calls. If no edit is needed, return [].`)
 	return b.String()
 }

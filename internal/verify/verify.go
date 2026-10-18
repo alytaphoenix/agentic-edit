@@ -36,6 +36,13 @@ func opTargets(op exec.EditOp, files map[string]string) []string {
 	return targets
 }
 
+// replayOp clears the preflight count so verification can replay an op that was
+// already part of a sequence (the count was validated before the first write).
+func replayOp(op exec.EditOp) exec.EditOp {
+	op.ExpectCount = 0
+	return op
+}
+
 // Run verifies res against the on-disk files. It replays the ops to skip
 // no-ops (an op that changed nothing must not trigger a false assertion
 // failure), then greps the actual files for each Assert (must be present) and
@@ -59,9 +66,9 @@ func Run(res *gen.Result, before, after map[string]string, client *laya.Client, 
 		if op.Kind == exec.KindGrep {
 			continue
 		}
-		// A delete op carries its regex Pattern on the EditOp; replace/insert
-		// use literal Assert/Deny values.
-		isDelete := op.Kind == exec.KindSed && op.Pattern != ""
+		// A delete op and a regex replace carry a regex Deny; literal replace
+		// and insert use literal Assert/Deny values.
+		isRegexDeny := op.DenyRegex
 
 		for _, f := range opTargets(op, before) {
 			if _, err := os.Stat(f); err != nil {
@@ -70,7 +77,7 @@ func Run(res *gen.Result, before, after map[string]string, client *laya.Client, 
 				continue
 			}
 
-			res2, err := exec.DryRun(op, state[f])
+			res2, err := exec.DryRun(replayOp(op), state[f])
 			if err == nil && res2 == state[f] {
 				// This op changed nothing on this file → no assertion applies.
 				continue
@@ -90,8 +97,8 @@ func Run(res *gen.Result, before, after map[string]string, client *laya.Client, 
 			}
 			if op.Deny != "" {
 				var n map[string]int
-				if isDelete {
-					n, _ = exec.Count(op.Deny, []string{f}, true) // Deny is a regex for delete ops
+				if isRegexDeny {
+					n, _ = exec.Count(op.Deny, []string{f}, true) // Deny is a regex
 				} else {
 					n, _ = exec.CountFixed(op.Deny, []string{f}) // literal value
 				}

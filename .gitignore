@@ -1,6 +1,10 @@
 # Compiled binary
 /aed
 
+# Transaction staging files (normally removed automatically)
+.aed-*
+/.aed/
+
 # Go build/test artifacts
 *.exe
 *.out

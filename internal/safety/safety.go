@@ -26,6 +26,13 @@ func Validate(op exec.EditOp) error {
 	if op.Kind == "grep" {
 		return nil // grep is read-only
 	}
+	// Operations rendered by compile.Render came from the fixed template
+	// whitelist, with values escaped and the address validated. The substring
+	// denylist below is a defense-in-depth check for hand-built ops; applying it
+	// to template output would reject legitimate literal values such as ":d".
+	if op.FromTemplate {
+		return nil
+	}
 	for _, b := range dangerous {
 		if strings.Contains(op.Script, b) {
 			return fmt.Errorf("blocked dangerous pattern %q in %s script", b, op.Kind)

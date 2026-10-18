@@ -107,6 +107,35 @@ func TestParseOpsRejectsBadScript(t *testing.T) {
 	}
 }
 
+func TestParseOpsRejectsScopeInjection(t *testing.T) {
+	// On GNU sed, "/x/;e id;/y/" would execute a shell command. The strict
+	// address validator must reject it before compilation.
+	for _, scope := range []string{
+		"/x/;e id;/y/",
+		"/x/;w /tmp/pwned;/y/",
+		"/x/!d;/y/",
+		"/x/{s/a/b/};/y/",
+	} {
+		txt := `[{"kind":"sed","x":"a","y":"b","scope":"` + scope + `"}]`
+		if _, ok := ParseOps(txt); ok {
+			t.Errorf("ParseOps accepted injection scope %q", scope)
+		}
+	}
+}
+
+func TestParseOpsRejectsUnknownFields(t *testing.T) {
+	// A model must not be able to smuggle extra fields (e.g. a raw script or a
+	// path) through the typed-op decoder.
+	for _, txt := range []string{
+		`[{"kind":"sed","x":"a","y":"b","script":"rm -rf /"}]`,
+		`[{"kind":"sed","x":"a","y":"b","path":"/etc/passwd"}]`,
+	} {
+		if _, ok := ParseOps(txt); ok {
+			t.Errorf("ParseOps accepted unknown fields: %s", txt)
+		}
+	}
+}
+
 func TestExtractPair(t *testing.T) {
 	cases := []struct {
 		in, x, y string

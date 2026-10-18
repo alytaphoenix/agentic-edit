@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"agentic-edit/internal/tx"
 )
 
 // Kind identifies the underlying utility.
@@ -33,18 +37,36 @@ type EditOp struct {
 	Assert  string // grep pattern that must be present after apply
 	Deny    string // grep pattern that must be absent after apply
 	Purpose string // human-readable description
+
+	// Optional preflight fields. They let the dry-run reject a replace that
+	// would hit an unexpected number of occurrences before any edit runs.
+	Old         string // literal or regex value being replaced
+	New         string // replacement value
+	Literal     bool   // Old is a literal string (default for replace)
+	ExpectCount int    // 0 = no count check; >0 = exact number of matches
+	DenyRegex   bool   // Deny is a regex (delete ops) rather than a literal
+
+	// FromTemplate marks an operation rendered by compile.Render through the
+	// fixed template whitelist. Such an op has already been structurally
+	// validated; the substring denylist is applied only to hand-built ops.
+	FromTemplate bool
 }
 
 // Line is a single grep match result.
 type Line struct {
-	File string
-	Num  int
-	Text string
+	File string `json:"file"`
+	Num  int    `json:"line"`
+	Text string `json:"text"`
 }
 
 // DryRun runs the operation against in-memory content and returns the result
 // without touching disk.
 func DryRun(op EditOp, content string) (string, error) {
+	if op.Kind == KindSed && op.Old != "" && op.ExpectCount > 0 {
+		if err := checkExpectCount(op, content); err != nil {
+			return "", err
+		}
+	}
 	switch op.Kind {
 	case KindSed:
 		return runSedStdin(op.Script, content)
@@ -57,80 +79,76 @@ func DryRun(op EditOp, content string) (string, error) {
 	}
 }
 
-// RunInPlace applies the operation to op.Path. It writes a .bak backup first,
-// preserves the original file mode, and performs an atomic replace, rolling
-// back on any failure.
-func RunInPlace(op EditOp) error {
-	if op.Kind == KindGrep || op.Path == "" {
-		return nil
+// checkExpectCount rejects an edit whose target value does not occur exactly
+// ExpectCount times. This is the main guard against an agent's "replace this
+// one thing" instruction silently changing every occurrence in a file.
+func checkExpectCount(op EditOp, content string) error {
+	var got int
+	if op.Literal {
+		got = strings.Count(content, op.Old)
+	} else {
+		re, err := regexp.Compile(op.Old)
+		if err != nil {
+			// Let sed report dialect-specific regex errors; the count guard is
+			// best-effort for regex mode.
+			return nil
+		}
+		got = len(re.FindAllStringIndex(content, -1))
 	}
-	info, err := os.Stat(op.Path)
-	if err != nil {
-		return err
-	}
-	if err := Backup(op.Path); err != nil {
-		return err
-	}
-	out, script, err := applyOp(op)
-	if err != nil {
-		Rollback(op.Path)
-		return fmt.Errorf("%s failed: %w", op.Kind, err)
-	}
-	if script != "" {
-		defer os.Remove(script)
-	}
-	tmp := op.Path + ".aed.tmp"
-	if err := writePreserving(tmp, out, info.Mode()); err != nil {
-		Rollback(op.Path)
-		return err
-	}
-	if err := os.Rename(tmp, op.Path); err != nil {
-		Rollback(op.Path)
-		return err
+	if got != op.ExpectCount {
+		return fmt.Errorf("expected %d occurrence(s) of %q but found %d; refusing to edit", op.ExpectCount, op.Old, got)
 	}
 	return nil
 }
 
-// applyOp runs a mutating op and returns its stdout plus any temp script path.
-func applyOp(op EditOp) ([]byte, string, error) {
-	switch op.Kind {
-	case KindSed:
-		script, err := writeTemp(op.Script)
-		if err != nil {
-			return nil, "", err
-		}
-		out, err := run("sed", "", "-f", script, op.Path)
-		return out, script, err
-	case KindAwk:
-		out, err := run("awk", "", op.Script, op.Path)
-		return out, "", err
-	default:
-		return nil, "", fmt.Errorf("cannot apply %s in place", op.Kind)
+// RunInPlace applies the operation to op.Path through a one-file transaction.
+// The new content is computed in memory, written to a random staging file, and
+// renamed into place only after its hash is verified. No sibling .bak or
+// .aed.tmp path is ever used.
+func RunInPlace(op EditOp) error {
+	if op.Kind == KindGrep || op.Path == "" {
+		return nil
 	}
-}
-
-// Backup copies path to path.bak, preserving the file mode.
-func Backup(path string) error {
-	in, err := os.ReadFile(path)
+	before, mode, err := tx.ReadFile(op.Path)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(path)
-	mode := os.FileMode(0o644)
-	if err == nil {
-		mode = info.Mode()
+	out, err := DryRun(op, string(before))
+	if err != nil {
+		return fmt.Errorf("%s failed: %w", op.Kind, err)
+	}
+	if out == string(before) {
+		return nil
+	}
+	t, err := tx.New(filepath.Dir(op.Path))
+	if err != nil {
+		return err
+	}
+	defer t.Cleanup()
+	if err := t.Stage(op.Path, before, []byte(out), mode); err != nil {
+		return err
+	}
+	return t.Commit()
+}
+
+// Backup copies path to path.bak, preserving the file mode. It is retained for
+// callers of the older API; aed's own edit path uses tx instead. The write is
+// atomic and replaces a pre-existing .bak symlink rather than following it.
+func Backup(path string) error {
+	in, mode, err := tx.ReadFile(path)
+	if err != nil {
+		return err
 	}
 	return writePreserving(path+".bak", in, mode)
 }
 
 // Rollback restores path from path.bak and removes any leftover temp file.
+// It is retained for callers of the older API.
 func Rollback(path string) {
 	os.Remove(path + ".aed.tmp")
-	if info, err := os.Stat(path + ".bak"); err == nil {
-		data, rerr := os.ReadFile(path + ".bak")
-		if rerr == nil {
-			_ = writePreserving(path, data, info.Mode())
-		}
+	data, mode, err := tx.ReadFile(path + ".bak")
+	if err == nil {
+		_ = writePreserving(path, data, mode)
 	}
 }
 
@@ -160,6 +178,47 @@ func SearchFixed(pattern string, files []string) ([]Line, error) {
 		return nil, err
 	}
 	return parseGrep(data), nil
+}
+
+// SearchRecursive runs grep -rHn from root. It is used by `aed grep` when no
+// explicit files are given, instead of passing "." to non-recursive grep.
+func SearchRecursive(pattern, root string, extended bool) ([]Line, error) {
+	args := []string{"-r", "-H", "-n"}
+	if extended {
+		args = append(args, "-E")
+	}
+	args = append(args, pattern, root)
+	data, err := grepOut(args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseGrep(data), nil
+}
+
+// CountRecursive returns per-file match counts under root.
+func CountRecursive(pattern, root string, extended bool) (map[string]int, error) {
+	args := []string{"-r", "-c"}
+	if extended {
+		args = append(args, "-E")
+	}
+	args = append(args, pattern, root)
+	data, err := grepOut(args...)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]int{}
+	for _, raw := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if raw == "" {
+			continue
+		}
+		i := strings.LastIndexByte(raw, ':')
+		if i < 0 {
+			continue
+		}
+		n, _ := strconv.Atoi(raw[i+1:])
+		out[raw[:i]] = n
+	}
+	return out, nil
 }
 
 func parseGrep(data []byte) []Line {
@@ -216,68 +275,7 @@ func CountFixed(pattern string, files []string) (map[string]int, error) {
 	return out, nil
 }
 
-// LineDiff returns a simple line-level diff of old vs new using an LCS table.
-// Each returned line is prefixed with ' ' (unchanged), '-' (removed) or '+'
-// (added).
-func LineDiff(old, new string) string {
-	a := splitLines(old)
-	b := splitLines(new)
-	table := lcs(a, b)
-
-	var sb strings.Builder
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch {
-		case a[i] == b[j]:
-			sb.WriteString("  " + a[i] + "\n")
-			i++
-			j++
-		case table[i+1][j] >= table[i][j+1]:
-			sb.WriteString("-" + a[i] + "\n")
-			i++
-		default:
-			sb.WriteString("+" + b[j] + "\n")
-			j++
-		}
-	}
-	for ; i < len(a); i++ {
-		sb.WriteString("-" + a[i] + "\n")
-	}
-	for ; j < len(b); j++ {
-		sb.WriteString("+" + b[j] + "\n")
-	}
-	return sb.String()
-}
-
-// splitLines splits on newlines, dropping a single trailing newline so that
-// identical files produce an all-context diff (no spurious empty final line).
-func splitLines(s string) []string {
-	s = strings.TrimSuffix(s, "\n")
-	if s == "" {
-		return nil
-	}
-	return strings.Split(s, "\n")
-}
-
-func lcs(a, b []string) [][]int {
-	n, m := len(a), len(b)
-	t := make([][]int, n+1)
-	for i := range t {
-		t[i] = make([]int, m+1)
-	}
-	for i := n - 1; i >= 0; i-- {
-		for j := m - 1; j >= 0; j-- {
-			if a[i] == b[j] {
-				t[i][j] = t[i+1][j+1] + 1
-			} else if t[i+1][j] >= t[i][j+1] {
-				t[i][j] = t[i+1][j]
-			} else {
-				t[i][j] = t[i][j+1]
-			}
-		}
-	}
-	return t
-}
+// LineDiff is implemented in diff.go.
 
 // --- command execution ---
 
@@ -332,26 +330,41 @@ func runSedStdin(script, stdinData string) (string, error) {
 }
 
 // writePreserving writes data to path using the given mode and fsyncs it before
-// returning, so the mode (including executable bits) is preserved exactly.
+// returning. It stages to a random temp file in the same directory and renames
+// it into place, so a pre-existing symlink at path is replaced rather than
+// followed, and a crash never leaves a partially written file.
 func writePreserving(path string, data []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".aed-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
+	tmp := f.Name()
+	cleanup := func() {
 		f.Close()
+		os.Remove(tmp)
+	}
+	if _, err := f.Write(data); err != nil {
+		cleanup()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		cleanup()
 		return err
 	}
-	// OpenFile applies the umask; enforce the requested mode explicitly.
-	if err := os.Chmod(path, mode); err != nil {
-		f.Close()
+	if err := f.Chmod(mode); err != nil {
+		cleanup()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // --- temp files ---

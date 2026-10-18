@@ -29,39 +29,55 @@ func Render(op intent.Op, force bool) (exec.EditOp, error) {
 	if err := op.Validate(); err != nil {
 		return exec.EditOp{}, err
 	}
+	var (
+		eo  exec.EditOp
+		err error
+	)
 	switch op.Kind {
 	case intent.KindSed:
-		return renderSed(op, force)
+		eo, err = renderSed(op, force)
 	case intent.KindAwk:
-		return renderAwk(op)
+		eo, err = renderAwk(op)
 	case intent.KindGrep:
-		return exec.EditOp{
+		eo = exec.EditOp{
 			Kind:    exec.KindGrep,
 			Pattern: op.Pattern,
 			Purpose: "find lines matching " + op.Pattern,
-		}, nil
+		}
 	default:
 		return exec.EditOp{}, fmt.Errorf("unknown op kind %q", op.Kind)
 	}
+	if err != nil {
+		return exec.EditOp{}, err
+	}
+	eo.FromTemplate = true
+	return eo, nil
 }
 
 func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 	switch op.SedAction() {
 	case "replace":
-		script, err := replaceScript(op.Scope, op.X, op.Y, op.Global)
+		literal := !op.Regex
+		global := op.Global || op.ExpectCount > 1
+		script, err := replaceScript(op.Scope, op.X, op.Y, global, literal)
 		if err != nil {
 			return exec.EditOp{}, err
 		}
 		eo := exec.EditOp{
-			Kind:    exec.KindSed,
-			Script:  script,
-			Assert:  op.Y,
-			Purpose: fmt.Sprintf("replace %q with %q", op.X, op.Y),
+			Kind:        exec.KindSed,
+			Script:      script,
+			Assert:      op.Y,
+			Old:         op.X,
+			New:         op.Y,
+			Literal:     literal,
+			ExpectCount: op.ExpectCount,
+			Purpose:     fmt.Sprintf("replace %q with %q", op.X, op.Y),
 		}
-		if op.Global {
+		if op.Global || op.ExpectCount > 1 {
 			// Only assert the old value is absent for a global replace; a
 			// partial replace can legitimately leave the old value elsewhere.
 			eo.Deny = op.X
+			eo.DenyRegex = !literal
 		}
 		return eo, nil
 	case "insert":
@@ -88,11 +104,12 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 			return exec.EditOp{}, err
 		}
 		return exec.EditOp{
-			Kind:    exec.KindSed,
-			Script:  script,
-			Pattern: op.Pattern, // set so the guard treats Deny as a regex
-			Deny:    op.Pattern, // the deleted pattern must be absent
-			Purpose: "delete lines matching " + op.Pattern,
+			Kind:      exec.KindSed,
+			Script:    script,
+			Pattern:   op.Pattern, // set so the guard treats Deny as a regex
+			Deny:      op.Pattern, // the deleted pattern must be absent
+			DenyRegex: true,
+			Purpose:   "delete lines matching " + op.Pattern,
 		}, nil
 	}
 	return exec.EditOp{}, fmt.Errorf("cannot render sed op")
@@ -110,17 +127,23 @@ func renderAwk(op intent.Op) (exec.EditOp, error) {
 	}, nil
 }
 
-// isAddr reports whether s is a well-formed /regex/ sed address.
+// isAddr reports whether s is a well-formed, restricted /regex/ sed address.
 func isAddr(s string) bool {
-	if len(s) < 2 || s[0] != '/' || s[len(s)-1] != '/' {
+	if len(s) < 2 || len(s) > 1024 || s[0] != '/' || s[len(s)-1] != '/' {
 		return false
 	}
-	return !strings.ContainsAny(s, "\r\n")
+	// Semicolon, braces, bang, and hash are sed command separators/control
+	// characters. Rejecting them prevents address-scope command injection such
+	// as "/x/;e id;/y/".
+	if strings.ContainsAny(s, "\r\n;{}!#") {
+		return false
+	}
+	return true
 }
 
 // --- sed template builders ---
 
-func replaceScript(scope, x, y string, global bool) (string, error) {
+func replaceScript(scope, x, y string, global, literal bool) (string, error) {
 	if strings.ContainsAny(x, "\r\n") || strings.ContainsAny(y, "\r\n") {
 		return "", fmt.Errorf("replace values must be single-line")
 	}
@@ -132,7 +155,13 @@ func replaceScript(scope, x, y string, global bool) (string, error) {
 	if !global {
 		flag = ""
 	}
-	return fmt.Sprintf("%ss|%s|%s|%s", addr, sedReplaceEscape(x), sedReplaceEscape(y), flag), nil
+	pattern := x
+	if literal {
+		pattern = sedPatternEscape(x)
+	} else {
+		pattern = sedReplaceEscape(x)
+	}
+	return fmt.Sprintf("%ss|%s|%s|%s", addr, pattern, sedReplaceEscape(y), flag), nil
 }
 
 func deleteScript(pattern string) (string, error) {
@@ -155,7 +184,9 @@ func insertScript(anchor, text string, before bool) (string, error) {
 		cmd = "i\\"
 	}
 	// POSIX multiline form so `sed -f` works on both GNU (Linux) and BSD (macOS).
-	return addr + cmd + "\n" + text, nil
+	// Backslashes are escaped so a trailing one cannot continue the sed command
+	// onto the following line.
+	return addr + cmd + "\n" + strings.ReplaceAll(text, `\`, `\\`), nil
 }
 
 // sedReplaceEscape escapes a value for use inside the s|...|...| command, using
@@ -164,6 +195,20 @@ func sedReplaceEscape(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, "|", `\|`)
 	s = strings.ReplaceAll(s, `&`, `\&`)
+	return s
+}
+
+// sedPatternEscape escapes a literal value so it matches only itself inside a
+// sed BRE pattern. This is the default for replace: "a.b" matches "a.b", not
+// "axb". Characters that are ordinary in BRE (+ ? ( ) { }) are left alone, so
+// the result stays portable between GNU and BSD sed.
+func sedPatternEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	// Delimiter.
+	s = strings.ReplaceAll(s, "|", `\|`)
+	for _, ch := range []string{".", "[", "]", "^", "$", "*", "&"} {
+		s = strings.ReplaceAll(s, ch, `\`+ch)
+	}
 	return s
 }
 
