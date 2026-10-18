@@ -2,11 +2,17 @@
 
 `aed` is a command-line tool that turns a natural-language edit instruction into
 safe, verifiable edits of one or more files. It drives the three classic Unix
-text utilities — **awk**, **sed**, and **grep** — and can lean on **Laya** (and
-any local Ollama / OpenAI-compatible model) for context and command generation.
+text utilities — **awk**, **sed**, and **grep** — for compatibility, and can use
+**Laya** for local edit-risk decisions plus an Ollama / OpenAI-compatible model
+for optional command generation.
 
-It is designed to be *safe by default*: it previews changes, writes backups,
-runs a safety denylist, and optionally verifies the result after applying.
+It is designed to be *safe by default*: it previews changes, applies them through
+a byte-exact all-or-nothing transaction, runs a safety denylist and a per-language
+syntax gate, confines paths, refuses symlinks/hardlinks, and verifies the result
+by hash after applying.
+
+For agents, `aed edit --json` emits a stable machine-readable result, and
+`--laya-safety=warn|block` adds a local decision-model review of the diff.
 
 ## Install / build
 
@@ -25,13 +31,23 @@ aed edit -a 'replace "v1" with "v3"' -f path/to/file.go
 # Apply without prompting, then verify the result
 aed edit -a 'replace "v1" with "v3"' -f path/to/file.go -y --verify
 
-# Edit several files at once
-aed edit -a 'insert "// generated" after line matching package' -f a.go -f b.go -y --verify
+# Edit several files at once (each replace must match exactly once)
+aed edit -a 'replace "v1" with "v3"' -f a.go -f b.go -y --verify
+
+# Allow a replace to hit every occurrence
+aed edit -a 'replace "v1" with "v3"' -f a.go -y --all
+
+# Machine-readable result for an agent
+aed edit -a 'replace "v1" with "v3"' -f a.go --json
+
+# Optional local Laya edit-risk review
+aed edit -a 'replace "v1" with "v3"' -f a.go --json \
+  --laya-safety=block --laya-token "$LAYA_MCP_TOKEN"
 
 # Transform lines with awk
 aed edit -a 'uppercase every line' -f notes.txt -y --verify
 
-# Plain grep (returns 0 even when nothing matches)
+# Plain grep (recursive when no files are given)
 aed grep -E '^todo' -n *.md
 ```
 
@@ -42,14 +58,22 @@ aed grep -E '^todo' -n *.md
 | `-f, --file` | Target file (repeatable) **[required]** |
 | `-a, --action` | Natural-language instruction **[required]** |
 | `--dry-run` | Preview only. Default on; pass `-y` to apply. |
-| `-y, --yes` | Apply without the interactive confirmation prompt. |
+| `-y, --yes` | Apply without the interactive confirmation prompt. `--apply` is an alias. |
 | `--verify` | After applying, assert the change and summarize the diff. **Default on.** |
-| `--no-verify` | Disable the post-apply verification guard. A guard failure exits `3`. |
-| `--check` | Syntax-check the edited result with the language's own parser (bash, python) **before** applying, so an edit that would leave invalid syntax is aborted **before** anything is written to disk. **Default on** (a regression exits `4`). |
-| `--no-check` | Skip the pre-apply syntax check. Alias for combining with `--verify` in special cases. |
+| `--no-verify` | Disable the post-apply verification guard. A guard failure exits `3` and rolls back. |
+| `--check` | Syntax-check the edited result with the language's own parser **before** applying. **Default on** (a regression exits `4`). |
+| `--no-check` | Skip the pre-apply syntax check. |
+| `--unique` | Require exactly one match for each replace. **Default on.** |
+| `--all` | Allow a replace to match more than once (turns off `--unique`). |
+| `--keep-on-failure` | Keep the edited file if verification fails. Default is automatic rollback. |
+| `--json` | Emit one JSON result on stdout; human progress goes to stderr. |
+| `--laya-safety` | `off` (default), `warn`, or `block`. Runs a Laya edit-risk decision over the diff. |
+| `--laya-safety-model` | Laya checkpoint/model name (default: server `auto`). |
+| `--laya-safety-threshold` | Confidence below this becomes `review` (default `0.65`). |
 | `--show-secrets` | Do not redact secrets from LLM prompts, stdout diffs, and the review prompt. Alias: `--no-scrub`. **Default off (scrub on).** |
-| `--llm` | Enable the LLM (Laya/Ollama/OpenAI) to plan the edit (**opt-in**). |
-| `--no-llm` | Skip LLM/Laya; use the deterministic generator only. |
+| `--allow-protected` | Allow editing protected paths (`.git/`, CI workflows, keys, `.env`, shell rc, Makefile, ...). |
+| `--llm` | Enable an Ollama / OpenAI-compatible model to plan the edit (**opt-in**). Laya itself is a decision model, not a generator. |
+| `--no-llm` | Skip LLM assistance; use the deterministic generator only. |
 | `--force` | Allow whole-file destructive deletes (e.g. delete matching `.`). |
 | `--root` | Workspace root for path confinement (default: current dir). |
 | `--laya-url` | Laya MCP endpoint (default `http://127.0.0.1:8420/mcp/`). |
@@ -63,32 +87,38 @@ aed grep -E '^todo' -n *.md
 ### `grep` subcommand
 
 ```sh
-aed grep [-E] [-c] PATTERN [FILE...]
+aed grep [-E] [-c] [--json] PATTERN [FILE...]
 ```
 
-A thin wrapper over `grep -Hn` (`-E` for extended regex, `-c` for counts). It
-exits `0` when nothing matches, so it is safe in scripts and previews.
+A thin wrapper over `grep -Hn` (`-E` for extended regex, `-c` for counts).
+With no `FILE` arguments it searches recursively from the current directory
+(`grep -rHn`) instead of passing `.` to non-recursive grep. `--json` emits
+`{"matches":[...]}` or `{"counts":{...}}`. It exits `0` when nothing matches, so
+it is safe in scripts and previews.
 
 ### `check` subcommand
 
 ```sh
-aed check FILE [FILE...]
+aed check [-json] FILE [FILE...]
 ```
 
-Runs each file's language syntax checker (bash `bash -n`, python `compile()`) and
-prints diagnostics in `path:line:col: message` form. Exits `4` if any file has
-syntax problems. Returns early on I/O or binary/size errors (exit `1`).
-Unsupported file types are reported as skipped, not as failures.
+Runs each file's language syntax checker and prints diagnostics in
+`path:line:col: message` form. `--json` emits a structured report. Exits `4` if
+any file has syntax problems. Returns early on I/O or binary/size errors (exit
+`1`). Unsupported file types are reported as skipped, not as failures.
 
 ### Exit codes
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success. |
-| `1` | Argument, I/O, or other runtime error. |
-| `2` | Usage error (unknown command / missing required flag). |
-| `3` | Post-apply verify guard failed (`--no-verify` to opt out). |
-| `4` | Syntax gate: the edit would leave invalid syntax (or `aed check` found problems). Override with `--no-check`. |
+| `0` | Success (including a preview or a no-op). |
+| `1` | Argument, I/O, preflight, or other runtime error. |
+| `2` | Usage error (unknown command / missing required flag / invalid safety mode). |
+| `3` | Post-apply verify guard failed. The transaction is rolled back unless `--keep-on-failure`. |
+| `4` | Syntax gate: the edit would leave invalid syntax. Override with `--no-check`. |
+| `5` | Policy denied (protected path, Laya `block`, or destructive edit). |
+| `6` | Conflict: a target changed after preview, or the workspace lock is held. |
+| `8` | Safety checker unavailable while `--laya-safety=block` (fail closed). |
 
 ## How it works
 
@@ -99,75 +129,94 @@ natural-language instruction
    plan.Parse            → structured intent + target files
           │
           ▼
-   plan.Enrich (Laya)    → optional background context (skipped if Laya off)
+   plan.Enrich (optional) → background context from a chat-capable MCP tool
           │
           ▼
    gen.Generate          → typed ops via intent.Parse + compile.Render
          └─ LLM (opt-in, --llm) → emits typed ops only, validated before render
           │
           ▼
-   safety.Validate       → denylist blocks :d, 1,$d, rm, system(), etc.
+   safety.Validate       → structural template check + denylist for hand-built ops
           │
           ▼
-   Dry-run (awk/sed/grep on in-memory content) → unified diff shown to the user
+   Dry-run (in-memory)   → unified diff; grep-only plans are read-only searches
           │
           ▼
    Syntax gate (internal/lang) — per-language parse of the in-memory result
           │
           ▼
-   Apply (backup → atomic replace) → verify (asserts + diff summary)
+   Optional Laya safety  → allow / review / block (advisory or fail-closed)
+          │
+          ▼
+   Transaction (internal/tx) → hash guard → stage → fsync → atomic rename
+          │
+          ▼
+   Verify (hash + asserts + diff summary) → rollback on failure
 ```
 
 By default the tool is fully deterministic: a small keyword grammar turns the
 instruction into **typed operations**, which are rendered through a fixed
-template whitelist. The only way to inject a command is as one of these known
-shapes — never a free-form script. The LLM is strictly **opt-in** (`--llm`);
-when used, the model may only emit structured, typed operations, which are
-validated before rendering.
+template whitelist. The LLM is strictly **opt-in** (`--llm`); when used, the
+model may only emit structured, typed operations, which are validated before
+rendering. Unknown JSON fields are rejected.
 ### Safety
 
 - **Safe by construction**: commands are produced from a fixed template
-  whitelist (`internal/compile`) by escaping inputs; a free-form script can
-  never be injected. This is the primary guarantee.
-- **Denylist** (`internal/safety`): defense-in-depth; operations containing
-  `:d`, `1,$d`, `1,$ s`, `rm -`, `> /dev/null`, `system(`, or `exit(1)` are
-  rejected.
-- **Path confinement**: files are resolved (realpath + symlink check) and must
-  stay inside `--root` (default: current dir). `..` escapes are refused.
+  whitelist (`internal/compile`) by escaping inputs. Replace is **literal by
+  default** (`"regex": true` in a typed op opts into sed regex matching), and
+  `scope` addresses are restricted to a single `/regex/` with command separators
+  rejected. A free-form script cannot be injected.
+- **Byte-exact transaction**: `internal/tx` stages the exact bytes that were
+  previewed and syntax-checked, fsyncs them, re-checks the original hash, and
+  renames atomically. There is no separate re-execution of `sed` at apply time.
+- **All-or-nothing rollback**: every touched file is part of one transaction. A
+  failure at any point restores every file already replaced. `--keep-on-failure`
+  opts out of the automatic rollback after a failed verify.
+- **No predictable sibling paths**: the old `file.bak` / `file.aed.tmp` names are
+  gone. Staging files use `os.CreateTemp` (random, `O_EXCL`) in the target
+  directory, so a pre-created symlink cannot redirect a write.
+- **Symlink/hardlink refusal**: target symlinks, hardlinked files, devices, and
+  other non-regular files are rejected. `..` escapes and symlinked paths outside
+  `--root` are refused.
+- **Hash stale-edit guard**: each target's SHA-256 is re-checked immediately
+  before the rename; a concurrent change returns exit `6` instead of being
+  overwritten. A per-workspace advisory lock serialises aed transactions.
+- **Protected paths**: `.git/`, `.hg/`, `.ssh/`, CI workflows, `.env`, keys,
+  credentials, shell rc files, Makefiles, Dockerfiles, and similar
+  code-execution/credential surfaces are refused unless `--allow-protected` is
+  passed.
 - **Binary / size guard**: files over 50 MB or containing NUL bytes are
   rejected up front.
-- **Stale-edit guard**: each target's mtime+size are re-checked right before
-  apply; if the file changed since the preview, the edit is aborted.
-- **Mode preservation + fsync**: applying writes to a temp file, fsyncs it, and
-  preserves the original file mode (including executable bits) across the atomic
-  rename.
+- **Mode preservation + fsync**: the original mode (including executable bits)
+  is preserved across the atomic rename; the file and its directory are fsynced.
 - **Exec timeout**: every awk/sed/grep call is bounded (`exec.DefaultTimeout`,
   30s).
-- **Private temp dir**: temp files live in a process-private directory that is
+- **Private temp dir**: sed scripts live in a process-private directory that is
   cleaned up on exit.
-- **Backups**: applying writes `<file>.bak` before mutating, and rolls back on
-  any failure.
-- **Secret scrubbing**: file contents flowing to an LLM prompt, printed diffs,
-  and the verify-review prompt are redacted by `internal/scrub` (AWS keys,
-  private keys, tokens, connection strings, `key = value` assignments) unless
-  `--show-secrets` (alias `--no-scrub`) is passed. Redaction is output-only — it
-  never changes what is written to disk.
+- **Secret scrubbing**: file contents, instructions, printed diffs, and the
+  verify-review prompt are redacted by `internal/scrub` (AWS keys, private keys,
+  tokens, connection strings, `key = value` assignments) unless `--show-secrets`
+  (alias `--no-scrub`) is passed. Redaction is output-only — it never changes
+  what is written to disk.
 - **Post-apply guard**: `verify` asserts the change actually landed (Assert =
-  new value present, Deny = old value / deleted pattern absent) using literal
-  `grep -F` matches, skips no-ops, and prints an error diff and exits `3` if not.
-  `--no-verify` opts out. On a failure in an interactive shell it prompts to
-  restore the file from its backup.
+  new value present, Deny = old value / deleted pattern absent), skips no-ops,
+  and prints an error diff. A failure exits `3` and rolls the whole transaction
+  back. `--no-verify` opts out.
 - **Syntax gate**: before applying, `internal/lang` runs each target's own
-  language parser (currently **bash** via `bash -n`, **python** via `compile()`)
-  on the in-memory result of the edit. A clean → broken transition aborts the
-  edit **before** anything is written and exits `4` (use `--no-check` to
+  language parser on the in-memory result. A clean → broken transition aborts
+  the edit **before** anything is written and exits `4` (use `--no-check` to
   override). Files that were already broken stay editable. The gate is
   pluggable: a language is an `init()`-registered `Checker` (see
   `internal/lang`). Binary location is overridable via `AED_BASH` /
   `AED_PYTHON`.
+- **Bounded diff**: the diff uses prefix/suffix trimming, patience anchors, and a
+  size-limited LCS instead of an `n×m` table. A 50,000-line file with a one-line
+  change now uses ~25 MB rather than ~221 MB at 5,000 lines.
 - **Preview first**: `edit` previews by default; use `-y` to apply.
 - **Destructive deletes gated**: whole-file deletes (a pattern matching every
   line) require `--force`.
+- **Read-only grep plans**: a `find ...` instruction returns matches and never
+  pretends the file was deleted or rewritten.
 
 ## Language support (pluggable syntax gate)
 
@@ -209,26 +258,63 @@ That one file makes `aed edit` show `syntax[FAILED]` (exit `4`) for Go files
 too, with no changes to `cli.go`. New-language support is also what lets
 `aed check` know about it automatically — no flag or register-table edits.
 
+## Laya edit-risk review
+
+`--laya-safety=warn|block` asks a local Laya MCP server (`laya_decide`) to
+classify the proposed diff. The state contains the instruction, the redacted
+diff, change stats, and deterministic flags; Laya returns a `risk`
+(`allow`/`review`/`block`), `intent_match`, `destructive`, `scope_creep`, and
+`secret_exposure`.
+
+Policy is monotonic: deterministic checks and the syntax gate remain
+authoritative, and Laya can only **escalate** (allow → review → block). A
+high-confidence `block` exits `5`; a low-confidence `allow` becomes `review`; if
+Laya is unavailable in `block` mode, aed exits `8` rather than silently
+continuing.
+
+Important: Laya is a fast decision model, not a generative LLM. The shipped base
+checkpoints are near chance zero-shot on typed decisions (its own benchmark:
+0.36 vs 0.318 random), while a fine-tuned checkpoint reaches 0.766. Treat the
+base model as an **advisory** prompt-injection/coarse-risk detector. For a real
+safety gate, fine-tune and calibrate a checkpoint on your own edit corpus:
+
+1. Log every transaction: instruction, redacted diff, deterministic flags, and
+   outcome (accepted, rejected, rolled back, human-modified).
+2. Add synthetic adversarial edits: mass deletion, CI/hook edits, `curl | sh`,
+   auth bypass, secret addition, bidi/zero-width trojans, prompt injection,
+   dependency confusion, permission changes.
+3. Keep hard negatives: legitimate large refactors, formatting, vendored code,
+   snapshot updates, migrations.
+4. Fine-tune with Laya's typed-decisions notebook (or a frozen-encoder head),
+   fit temperatures, and evaluate per-class recall, false-negative rate, ECE,
+   and review rate on held-out repos.
+5. Ship a versioned checkpoint and choose a high-recall threshold; never let the
+   model be the only gate.
+
 ## Architecture
 
 | Package | Responsibility |
 |---------|----------------|
 | `cmd/aed` | CLI entrypoint |
 | `internal/cli` | Flag parsing, the edit/grep command loop |
-| `internal/plan` | Intent parsing + Laya context enrichment |
+| `internal/plan` | Intent parsing + optional chat-capable context enrichment |
 | `internal/intent` | Parses instruction into typed ops; validates structure |
 | `internal/compile` | Renders typed ops through a fixed safe-template whitelist |
 | `internal/gen` | Wires LLM (opt-in, typed ops only) + deterministic pipeline |
-| `internal/exec` | Safe `DryRun`/`RunInPlace` wrappers over awk/sed/grep, line search, diffing |
-| `internal/safety` | Denylist validation |
+| `internal/exec` | `DryRun`/`RunInPlace`, literal/regex replaces, grep search, bounded diff |
+| `internal/tx` | Hash-guarded, atomic, all-or-nothing file transactions |
+| `internal/safety` | Structural template check + denylist for hand-built ops |
 | `internal/lang` | Per-language syntax gate (pluggable: bash, python today; CommandChecker adapts any CLI) |
 | `internal/scrub` | Redacts secrets from LLM prompts, stdout, and the review prompt |
-| `internal/verify` | Post-apply asserts + diff summary + optional Laya review |
-| `internal/laya` | Laya MCP client |
+| `internal/verify` | Post-apply asserts + diff summary + optional chat-capable review |
+| `internal/laya` | Laya MCP client (initialize, SSE, `laya_decide`/`laya_predict`) |
+| `internal/layasafety` | Typed edit-risk decision + conservative policy normalization |
 | `internal/llm` | Ollama / OpenAI-compatible HTTP clients |
 
 ## Tests
 
 ```sh
 go test ./...
+go test -race ./...
+go vet ./...
 ```
