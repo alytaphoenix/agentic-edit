@@ -36,7 +36,10 @@ except Exception as e:
     sys.exit(1)
 `
 
-var yamlLineCol = regexp.MustCompile(`(?i)(?:line\s+)?(\d+):\s*(.+)`)
+var (
+	yamlLineRe = regexp.MustCompile(`line\s+(\d+)`)
+	yamlColRe  = regexp.MustCompile(`col(?:umn)?\s+(\d+)`)
+)
 
 func parseYamlOutput(output string) []Diagnostic {
 	out := strings.TrimSpace(output)
@@ -51,10 +54,10 @@ func parseYamlOutput(output string) []Diagnostic {
 		}
 		d := Diagnostic{Message: "yaml: " + line}
 		// PyYAML errors usually look like: "found duplicate key ... (line: 2, col: 3)"
-		if m := regexp.MustCompile(`line\s+(\d+)`).FindStringSubmatch(line); m != nil {
+		if m := yamlLineRe.FindStringSubmatch(line); m != nil {
 			d.Line = atoiOr0(m[1])
 		}
-		if m := regexp.MustCompile(`col(?:umn)?\s+(\d+)`).FindStringSubmatch(line); m != nil {
+		if m := yamlColRe.FindStringSubmatch(line); m != nil {
 			d.Col = atoiOr0(m[1])
 		}
 		diags = append(diags, d)

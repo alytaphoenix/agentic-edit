@@ -127,7 +127,8 @@ func (c *CommandChecker) Check(ctx context.Context, path, content string) ([]Dia
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, bin, args...)
+	// bin is a registered checker (or its AED_* override); args are fixed.
+	cmd := exec.CommandContext(cctx, bin, args...) // #nosec G204 -- fixed checker with argv, no shell
 	cmd.Stdin = strings.NewReader(content)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -142,13 +143,13 @@ func (c *CommandChecker) Check(ctx context.Context, path, content string) ([]Dia
 	}
 
 	out := strings.TrimSpace(buf.String())
-	if c.Unavailable == nil {
-		c.Unavailable = func(o string) bool {
-			l := strings.ToLower(o)
-			return strings.Contains(l, "no module named") || strings.Contains(l, "modulenotfounderror") || strings.Contains(l, "cannot find module")
-		}
+	// Use a local function instead of assigning c.Unavailable: Check may be
+	// called concurrently, and mutating the shared checker was a data race.
+	unavailable := c.Unavailable
+	if unavailable == nil {
+		unavailable = defaultUnavailable
 	}
-	if c.Unavailable(out) {
+	if unavailable(out) {
 		return nil, fmt.Errorf("%w: %s", ErrUnavailable, unavailableReason(out))
 	}
 	if out == "" {
@@ -162,6 +163,16 @@ func (c *CommandChecker) Check(ctx context.Context, path, content string) ([]Dia
 		diags[i].File = path // report against the real file, not the pipe
 	}
 	return diags, nil
+}
+
+// defaultUnavailable recognizes the common "the checker's runtime dependency is
+// not installed" messages so they are reported as skipped rather than as a
+// syntax failure.
+func defaultUnavailable(out string) bool {
+	l := strings.ToLower(out)
+	return strings.Contains(l, "no module named") ||
+		strings.Contains(l, "modulenotfounderror") ||
+		strings.Contains(l, "cannot find module")
 }
 
 // unavailableReason returns a single human-readable line suitable for reporting

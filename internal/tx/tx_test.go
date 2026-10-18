@@ -188,3 +188,69 @@ func TestNoPredictableSiblingPaths(t *testing.T) {
 		t.Fatalf("outside file was modified: %q", got)
 	}
 }
+
+// A path outside the root must be rejected even though the file itself exists
+// and is writable. os.Root is the last line of defence if a caller forgets to
+// confine a path.
+func TestStageRejectsPathOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Cleanup()
+	if err := tr.Stage(outside, []byte("x\n"), []byte("y\n"), 0o644); err == nil {
+		t.Fatal("expected a path outside the root to be rejected")
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "x\n" {
+		t.Fatalf("outside file changed: %q", got)
+	}
+}
+
+// A symlinked parent directory that points outside the root must not be usable
+// to reach a file outside it, even when the lexical path looks confined.
+func TestStageRejectsSymlinkedParentEscape(t *testing.T) {
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "victim.txt")
+	if err := os.WriteFile(outside, []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "sub")
+	if err := os.Symlink(outsideDir, link); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Cleanup()
+	if err := tr.Stage(filepath.Join(link, "victim.txt"), []byte("safe\n"), []byte("pwned\n"), 0o644); err == nil {
+		t.Fatal("expected a symlinked parent escape to be rejected")
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "safe\n" {
+		t.Fatalf("outside file changed: %q", got)
+	}
+}
+
+func TestReadFileLimitRejectsOversize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReadFileLimit(path, 5); err == nil {
+		t.Fatal("expected an oversize file to be rejected before reading")
+	}
+	data, _, err := ReadFileLimit(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "0123456789" {
+		t.Fatalf("data = %q", data)
+	}
+}

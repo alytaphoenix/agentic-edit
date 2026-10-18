@@ -14,6 +14,15 @@ import (
 	"time"
 )
 
+// client refuses redirects so an Authorization header cannot be replayed to a
+// different endpoint chosen by the server.
+var client = &http.Client{
+	Timeout: 120 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 // Ollama calls a locally running Ollama server and returns the generated text.
 func Ollama(ctx context.Context, url, model, prompt string) (string, error) {
 	payload := map[string]any{
@@ -29,13 +38,18 @@ func Ollama(ctx context.Context, url, model, prompt string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := readLimited(resp)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("ollama: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
 
 	var out struct {
 		Response string `json:"response"`
@@ -67,13 +81,18 @@ func OpenAICompatible(ctx context.Context, baseURL, apiKey, model, prompt string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := readLimited(resp)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("openai-compatible: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
 
 	var out struct {
 		Choices []struct {
@@ -89,4 +108,19 @@ func OpenAICompatible(ctx context.Context, baseURL, apiKey, model, prompt string
 		return "", fmt.Errorf("empty completion")
 	}
 	return strings.TrimSpace(out.Choices[0].Message.Content), nil
+}
+
+// maxResponseBytes bounds a model response body so a misbehaving backend cannot
+// exhaust aed's memory.
+const maxResponseBytes = 8 << 20
+
+func readLimited(resp *http.Response) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxResponseBytes {
+		return nil, fmt.Errorf("model response exceeds %d bytes", maxResponseBytes)
+	}
+	return data, nil
 }

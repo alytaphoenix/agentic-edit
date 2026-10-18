@@ -1,6 +1,9 @@
 package scrub
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRedactFormatPatterns(t *testing.T) {
 	cases := []struct {
@@ -86,4 +89,31 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+func TestRedactExpandedTokenFormats(t *testing.T) {
+	cases := map[string]string{
+		"openai":    "sk-proj-abcdefghijklmnopqrstuvwxyz",
+		"anthropic": "sk-ant-abcdefghijklmnopqrstuvwxyz",
+		"gitlab":    "glpat-abcdefghijklmnopqrst",
+		"google":    "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+		"stripe":    "sk_live_abcdefghijklmnop",
+		"jwt":       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+	}
+	for name, secret := range cases {
+		out := Redact("value = " + secret + "\n")
+		if strings.Contains(out, secret) {
+			t.Errorf("%s secret leaked: %q", name, out)
+		}
+		if !strings.Contains(out, "[REDACTED:") {
+			t.Errorf("%s was not marked: %q", name, out)
+		}
+	}
+}
+
+func TestRedactQuotedValueWithSpaces(t *testing.T) {
+	out := Redact(`password = "correct horse battery staple"` + "\n")
+	if strings.Contains(out, "horse") || strings.Contains(out, "staple") {
+		t.Fatalf("quoted secret leaked: %q", out)
+	}
 }

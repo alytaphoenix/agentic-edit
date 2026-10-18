@@ -70,6 +70,7 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 			Old:         op.X,
 			New:         op.Y,
 			Literal:     literal,
+			Extended:    !literal, // regex replaces are POSIX ERE via sed -E
 			ExpectCount: op.ExpectCount,
 			Purpose:     fmt.Sprintf("replace %q with %q", op.X, op.Y),
 		}
@@ -104,12 +105,13 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 			return exec.EditOp{}, err
 		}
 		return exec.EditOp{
-			Kind:      exec.KindSed,
-			Script:    script,
-			Pattern:   op.Pattern, // set so the guard treats Deny as a regex
-			Deny:      op.Pattern, // the deleted pattern must be absent
-			DenyRegex: true,
-			Purpose:   "delete lines matching " + op.Pattern,
+			Kind:             exec.KindSed,
+			Script:           script,
+			Pattern:          op.Pattern, // marks this as a delete op
+			Deny:             op.Pattern, // the deleted pattern must be absent
+			DenyRegex:        true,
+			DeleteAllAllowed: force,
+			Purpose:          "delete lines matching " + op.Pattern,
 		}, nil
 	}
 	return exec.EditOp{}, fmt.Errorf("cannot render sed op")
@@ -135,7 +137,7 @@ func isAddr(s string) bool {
 	// Semicolon, braces, bang, and hash are sed command separators/control
 	// characters. Rejecting them prevents address-scope command injection such
 	// as "/x/;e id;/y/".
-	if strings.ContainsAny(s, "\r\n;{}!#") {
+	if strings.ContainsAny(s, "\r\n;{}!#\\") {
 		return false
 	}
 	return true
@@ -155,13 +157,18 @@ func replaceScript(scope, x, y string, global, literal bool) (string, error) {
 	if !global {
 		flag = ""
 	}
+	delim := pickDelimiter(x, y)
 	pattern := x
 	if literal {
-		pattern = sedPatternEscape(x)
+		pattern = sedLiteralEscape(x, delim)
 	} else {
-		pattern = sedReplaceEscape(x)
+		// A regex is passed through with only the delimiter escaped. Escaping
+		// backslashes here (as the replacement escaper does) would turn a regex
+		// dot into a literal backslash plus any character.
+		pattern = sedRegexEscape(x, delim)
 	}
-	return fmt.Sprintf("%ss|%s|%s|%s", addr, pattern, sedReplaceEscape(y), flag), nil
+	replacement := sedReplacementEscape(y, delim)
+	return fmt.Sprintf("%ss%c%s%c%s%c%s", addr, delim, pattern, delim, replacement, delim, flag), nil
 }
 
 func deleteScript(pattern string) (string, error) {
@@ -189,26 +196,59 @@ func insertScript(anchor, text string, before bool) (string, error) {
 	return addr + cmd + "\n" + strings.ReplaceAll(text, `\`, `\\`), nil
 }
 
-// sedReplaceEscape escapes a value for use inside the s|...|...| command, using
-// '|' as the delimiter. Backslash is escaped first so later escapes survive.
-func sedReplaceEscape(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, "|", `\|`)
-	s = strings.ReplaceAll(s, `&`, `\&`)
-	return s
+// pickDelimiter chooses a sed s-command delimiter that occurs in neither the
+// pattern nor the replacement. This keeps a regex alternation such as "a|b"
+// meaningful instead of escaping it into a literal pipe.
+func pickDelimiter(x, y string) byte {
+	for _, d := range []byte("|#%@~") {
+		if !strings.ContainsRune(x, rune(d)) && !strings.ContainsRune(y, rune(d)) {
+			return d
+		}
+	}
+	return '|'
 }
 
-// sedPatternEscape escapes a literal value so it matches only itself inside a
-// sed BRE pattern. This is the default for replace: "a.b" matches "a.b", not
-// "axb". Characters that are ordinary in BRE (+ ? ( ) { }) are left alone, so
-// the result stays portable between GNU and BSD sed.
-func sedPatternEscape(s string) string {
+// sedLiteralEscape escapes a literal value so it matches only itself inside the
+// s-command pattern. Backslash is escaped first so later escapes survive.
+func sedLiteralEscape(s string, delim byte) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
-	// Delimiter.
-	s = strings.ReplaceAll(s, "|", `\|`)
+	s = strings.ReplaceAll(s, string(delim), `\`+string(delim))
 	for _, ch := range []string{".", "[", "]", "^", "$", "*", "&"} {
 		s = strings.ReplaceAll(s, ch, `\`+ch)
 	}
+	return s
+}
+
+// sedRegexEscape escapes only the s-command delimiter for a regex pattern. A
+// delimiter preceded by an odd number of backslashes is already escaped and is
+// left alone.
+func sedRegexEscape(s string, delim byte) string {
+	var b strings.Builder
+	backslashes := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' {
+			backslashes++
+			b.WriteByte(c)
+			continue
+		}
+		if c == delim && backslashes%2 == 0 {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+		backslashes = 0
+	}
+	return b.String()
+}
+
+// sedReplacementEscape escapes a replacement value: backslash, "&", and the
+// chosen delimiter.
+func sedReplacementEscape(s string, delim byte) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	// The delimiter is now unescaped in the escaped string (the backslash
+	// doubling above makes every preceding run even), so escape it directly.
+	s = strings.ReplaceAll(s, string(delim), `\`+string(delim))
+	s = strings.ReplaceAll(s, `&`, `\&`)
 	return s
 }
 

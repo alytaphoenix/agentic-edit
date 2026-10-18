@@ -31,12 +31,14 @@ func acquireRootLock(root string) (*rootLock, error) {
 	}
 	sum := sha256.Sum256([]byte(root))
 	name := filepath.Join(dir, hex.EncodeToString(sum[:])[:32]+".lock")
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0o600)
+	// The name is a hash of the resolved root under a 0700 per-user cache dir;
+	// O_NOFOLLOW prevents a pre-created symlink from redirecting the open.
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600) // #nosec G304 -- generated path under a private dir
 	if err != nil {
 		return nil, nil
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("another aed transaction is running for this workspace: %w", err)
 	}
 	return &rootLock{f: f}, nil

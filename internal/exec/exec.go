@@ -43,8 +43,13 @@ type EditOp struct {
 	Old         string // literal or regex value being replaced
 	New         string // replacement value
 	Literal     bool   // Old is a literal string (default for replace)
+	Extended    bool   // regex replaces are rendered for sed -E (POSIX ERE)
 	ExpectCount int    // 0 = no count check; >0 = exact number of matches
 	DenyRegex   bool   // Deny is a regex (delete ops) rather than a literal
+	// DeleteAllAllowed permits a delete whose pattern removes every line. The
+	// compile layer sets this from --force; DryRun enforces it against the
+	// actual content so a broad regex cannot bypass the gate.
+	DeleteAllAllowed bool
 
 	// FromTemplate marks an operation rendered by compile.Render through the
 	// fixed template whitelist. Such an op has already been structurally
@@ -69,7 +74,15 @@ func DryRun(op EditOp, content string) (string, error) {
 	}
 	switch op.Kind {
 	case KindSed:
-		return runSedStdin(op.Script, content)
+		out, err := runSedStdin(op.Script, content, op.Extended)
+		if err != nil {
+			return "", err
+		}
+		if op.Pattern != "" && !op.DeleteAllAllowed &&
+			strings.TrimRight(out, "\r\n") == "" && strings.TrimRight(content, "\r\n") != "" {
+			return "", fmt.Errorf("delete pattern %q removes every line; re-run with --force to allow whole-file deletion", op.Pattern)
+		}
+		return out, nil
 	case KindAwk:
 		return runStdin(op.Kind, op.Script, content)
 	case KindGrep:
@@ -89,9 +102,9 @@ func checkExpectCount(op EditOp, content string) error {
 	} else {
 		re, err := regexp.Compile(op.Old)
 		if err != nil {
-			// Let sed report dialect-specific regex errors; the count guard is
-			// best-effort for regex mode.
-			return nil
+			// Refuse rather than skip the count guard: a pattern the counter
+			// cannot evaluate must not become an unbounded delete/replace.
+			return fmt.Errorf("cannot evaluate regex %q for the count guard: %v", op.Old, err)
 		}
 		got = len(re.FindAllStringIndex(content, -1))
 	}
@@ -131,34 +144,15 @@ func RunInPlace(op EditOp) error {
 	return t.Commit()
 }
 
-// Backup copies path to path.bak, preserving the file mode. It is retained for
-// callers of the older API; aed's own edit path uses tx instead. The write is
-// atomic and replaces a pre-existing .bak symlink rather than following it.
-func Backup(path string) error {
-	in, mode, err := tx.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	return writePreserving(path+".bak", in, mode)
-}
-
-// Rollback restores path from path.bak and removes any leftover temp file.
-// It is retained for callers of the older API.
-func Rollback(path string) {
-	os.Remove(path + ".aed.tmp")
-	data, mode, err := tx.ReadFile(path + ".bak")
-	if err == nil {
-		_ = writePreserving(path, data, mode)
-	}
-}
-
 // Search runs grep -Hn over files and returns parsed matches.
 func Search(pattern string, files []string, extended bool) ([]Line, error) {
 	args := []string{"-H", "-n"}
 	if extended {
 		args = append(args, "-E")
 	}
-	args = append(args, pattern)
+	// "--" stops grep from interpreting a pattern or filename that begins
+	// with "-" as an option (e.g. -f would read patterns from a file).
+	args = append(args, "--", pattern)
 	args = append(args, files...)
 	data, err := grepOut(args...)
 	if err != nil {
@@ -171,7 +165,7 @@ func Search(pattern string, files []string, extended bool) ([]Line, error) {
 // matches. It is used by the post-apply guard to assert literal replacement
 // values without interpreting regex metacharacters.
 func SearchFixed(pattern string, files []string) ([]Line, error) {
-	args := []string{"-H", "-n", "-F", pattern}
+	args := []string{"-H", "-n", "-F", "--", pattern}
 	args = append(args, files...)
 	data, err := grepOut(args...)
 	if err != nil {
@@ -187,7 +181,7 @@ func SearchRecursive(pattern, root string, extended bool) ([]Line, error) {
 	if extended {
 		args = append(args, "-E")
 	}
-	args = append(args, pattern, root)
+	args = append(args, "--", pattern, root)
 	data, err := grepOut(args...)
 	if err != nil {
 		return nil, err
@@ -201,7 +195,7 @@ func CountRecursive(pattern, root string, extended bool) (map[string]int, error)
 	if extended {
 		args = append(args, "-E")
 	}
-	args = append(args, pattern, root)
+	args = append(args, "--", pattern, root)
 	data, err := grepOut(args...)
 	if err != nil {
 		return nil, err
@@ -251,7 +245,7 @@ func Count(pattern string, files []string, extended bool) (map[string]int, error
 		if extended {
 			args = append(args, "-E")
 		}
-		args = append(args, pattern, f)
+		args = append(args, "--", pattern, f)
 		data, err := grepOut(args...)
 		if err != nil {
 			return nil, err
@@ -265,7 +259,7 @@ func Count(pattern string, files []string, extended bool) (map[string]int, error
 func CountFixed(pattern string, files []string) (map[string]int, error) {
 	out := map[string]int{}
 	for _, f := range files {
-		args := []string{"-c", "-F", pattern, f}
+		args := []string{"-c", "-F", "--", pattern, f}
 		data, err := grepOut(args...)
 		if err != nil {
 			return nil, err
@@ -283,7 +277,7 @@ func CountFixed(pattern string, files []string) (map[string]int, error) {
 func run(name string, stdin string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- name is sed/awk/grep; args are never shell-interpreted
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -309,7 +303,7 @@ func runStdin(name, script, stdinData string) (string, error) {
 }
 
 func grepStdin(pattern, content string) (string, error) {
-	out, err := run("grep", content, "-n", pattern)
+	out, err := run("grep", content, "-n", "--", pattern)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && (exitErr.ExitCode() == 1 || exitErr.ExitCode() == -1) {
 			return "", nil
@@ -319,52 +313,19 @@ func grepStdin(pattern, content string) (string, error) {
 	return string(out), nil
 }
 
-func runSedStdin(script, stdinData string) (string, error) {
+func runSedStdin(script, stdinData string, extended bool) (string, error) {
 	path, err := writeTemp(script)
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(path)
-	out, err := run("sed", stdinData, "-f", path)
+	args := []string{}
+	if extended {
+		args = append(args, "-E")
+	}
+	args = append(args, "-f", path)
+	out, err := run("sed", stdinData, args...)
 	return string(out), err
-}
-
-// writePreserving writes data to path using the given mode and fsyncs it before
-// returning. It stages to a random temp file in the same directory and renames
-// it into place, so a pre-existing symlink at path is replaced rather than
-// followed, and a crash never leaves a partially written file.
-func writePreserving(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".aed-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	cleanup := func() {
-		f.Close()
-		os.Remove(tmp)
-	}
-	if _, err := f.Write(data); err != nil {
-		cleanup()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := f.Chmod(mode); err != nil {
-		cleanup()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
 }
 
 // --- temp files ---
@@ -391,7 +352,7 @@ func tempDir() (string, error) {
 		return tempDirStr, nil
 	}
 	if info, err := os.Stat(tempDirStr); err != nil || !info.IsDir() {
-		os.RemoveAll(tempDirStr)
+		_ = os.RemoveAll(tempDirStr)
 		tempDirStr = ""
 		p, err := os.MkdirTemp("", "aed-*")
 		if err != nil {
@@ -428,12 +389,12 @@ func writeTemp(content string) (string, error) {
 	}
 	name := f.Name()
 	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(name)
+		_ = f.Close()
+		_ = os.Remove(name)
 		return "", err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(name)
+		_ = os.Remove(name)
 		return "", err
 	}
 	return name, nil

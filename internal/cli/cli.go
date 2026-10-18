@@ -38,8 +38,8 @@ const usageText = `aed — agentic file editing with awk/sed/grep + Laya
 
 Usage:
   aed edit   -a "instruction" -f FILE [-f FILE...] [options]
-  aed check  [-json] FILE [FILE...]
-  aed grep   [-E] [-c] [--json] PATTERN [FILE...]
+  aed check  [--json] FILE [FILE...]
+  aed grep   [-E] [-c] [--json] [--show-secrets] PATTERN [FILE...]
   aed list-laya-tools [--laya-url URL] [--laya-token TOKEN]
   aed version
   aed help
@@ -149,6 +149,8 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		humanOut = stderr
 	}
 	res := editResult{Version: 1, DryRun: *dry}
+	apply := *yes || !*dry
+	res.DryRun = !apply
 	defer func() {
 		if !jsonMode {
 			return
@@ -176,13 +178,35 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 	useLLM := *llmOn && !*noLLM
 	forceDeletes := *force
 	requireUnique := *unique && !*all
+
+	// Validate the safety mode up front so a typo is a usage error, not a
+	// silent no-op discovered after the edit has been previewed.
+	sMode := layasafety.Mode(strings.ToLower(strings.TrimSpace(*safetyMode)))
+	if sMode != layasafety.Off && sMode != layasafety.Warn && sMode != layasafety.Block {
+		msg := fmt.Sprintf("invalid --laya-safety %q (want off, warn, or block)", *safetyMode)
+		fmt.Fprintln(stderr, "error: "+msg)
+		res.Error = &editError{Code: 2, Message: msg}
+		return 2
+	}
+	if *safetyThreshold < 0 || *safetyThreshold > 1 {
+		msg := fmt.Sprintf("invalid --laya-safety-threshold %v (want 0..1)", *safetyThreshold)
+		fmt.Fprintln(stderr, "error: "+msg)
+		res.Error = &editError{Code: 2, Message: msg}
+		return 2
+	}
 	root := *rootFlag
 	if root == "" {
 		if wd, err := os.Getwd(); err == nil {
 			root = wd
 		}
 	}
+	// Resolve the root once so protected-path checks compare against the same
+	// real tree that confine() enforces. Using an unresolved root here let a
+	// --root symlink hide a protected path behind a "../" relative name.
 	rootForRel, _ := filepath.Abs(root)
+	if realRoot, err := filepath.EvalSymlinks(rootForRel); err == nil {
+		rootForRel = realRoot
+	}
 
 	// scrubFn redacts secrets from LLM prompts and stdout unless --show-secrets.
 	var scrubFn func(string) string
@@ -205,15 +229,13 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
-		rootForRel, _ := filepath.Abs(root)
-		rootForRel, _ = filepath.Abs(root)
 		if rel, err := filepath.Rel(rootForRel, real); err == nil && isProtected(rel) && !*allowProtected {
 			msg := fmt.Sprintf("%q is a protected path; re-run with --allow-protected to edit it", f)
 			fmt.Fprintf(stderr, "policy: %s\n", msg)
 			res.Error = &editError{Code: 5, Message: msg}
 			return 5
 		}
-		data, mode, err := tx.ReadFile(real)
+		data, mode, err := tx.ReadFileLimit(real, maxFileBytes)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", real, err)
 			res.Error = &editError{Code: 1, Message: err.Error()}
@@ -273,11 +295,13 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		}
 	}
 
-	// Default to a unique literal replace: an agent asking to change "one
-	// thing" must not silently rewrite every occurrence. --all opts out.
+	// Default to a unique replace: an agent asking to change "one thing" must
+	// not silently rewrite every occurrence. --all opts out. This applies to
+	// regex replaces too, where sed would otherwise replace the first match on
+	// every line.
 	for i := range generated.Ops {
 		op := &generated.Ops[i]
-		if op.Kind == exec.KindSed && op.Old != "" && op.Literal && requireUnique && op.ExpectCount == 0 {
+		if op.Kind == exec.KindSed && op.Old != "" && requireUnique && op.ExpectCount == 0 {
 			op.ExpectCount = 1
 		}
 	}
@@ -399,14 +423,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 
 	// Optional Laya edit-risk review. Deterministic gates above remain
 	// authoritative; Laya can only escalate, never grant permission.
-	sMode := layasafety.Mode(strings.ToLower(strings.TrimSpace(*safetyMode)))
 	if sMode != layasafety.Off {
-		if sMode != layasafety.Warn && sMode != layasafety.Block {
-			msg := fmt.Sprintf("invalid --laya-safety %q (want off, warn, or block)", *safetyMode)
-			fmt.Fprintln(stderr, "error: "+msg)
-			res.Error = &editError{Code: 2, Message: msg}
-			return 2
-		}
 		if !client.Configured() {
 			msg := "laya safety requested but --laya-token/--laya-url is not configured"
 			fmt.Fprintln(humanOut, "laya-safety[unavailable]: "+msg)
@@ -425,15 +442,16 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 				relForFlags, _ := filepath.Rel(rootForRel, f)
 				state := map[string]any{
 					"instruction": scrubFn(intent.Description),
-					"path":        f,
+					"path":        scrubFn(filepath.ToSlash(relForFlags)),
 					"diff":        scrubFn(d),
 					"stats":       fmt.Sprintf("+%d -%d", added, removed),
 					"flags":       fmt.Sprintf("syntax=checked; protected=%t", isProtected(relForFlags)),
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				v, err := layasafety.Check(ctx, client, state, layasafety.Options{
-					Model:      *safetyModel,
-					BlockBelow: *safetyThreshold,
+					Model:         *safetyModel,
+					BlockBelow:    *safetyThreshold,
+					RequireIntent: true,
 				})
 				cancel()
 				sr := safetyResult{Path: f, Status: v.Risk, Confidence: v.Confidence, Reason: v.Reason}
@@ -457,7 +475,15 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 						return 5
 					}
 				case v.Risk == "review":
-					fmt.Fprintf(humanOut, "laya-safety[review] %s: %s (confidence %.2f)\n", f, v.Reason, v.Confidence)
+					msg := fmt.Sprintf("%s: %s (confidence %.2f)", f, v.Reason, v.Confidence)
+					fmt.Fprintln(humanOut, "laya-safety[review] "+msg)
+					// In block mode an uncertain answer is not permission to
+					// proceed: fail closed and require a human or the explicit
+					// advisory mode.
+					if sMode == layasafety.Block {
+						res.Error = &editError{Code: 5, Message: "laya-safety review required: " + msg}
+						return 5
+					}
 				default:
 					fmt.Fprintf(humanOut, "laya-safety[ok] %s (confidence %.2f)\n", f, v.Confidence)
 				}
@@ -465,8 +491,6 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		}
 	}
 
-	apply := *yes || !*dry
-	res.DryRun = !apply
 	if changedFiles == 0 {
 		fmt.Fprintln(humanOut, "\n(no changes)")
 		return 0
@@ -545,9 +569,12 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		if err != nil || tx.Hash(data) != tx.Hash([]byte(after[f])) {
 			msg := fmt.Sprintf("hash verification failed for %s", f)
 			fmt.Fprintln(humanOut, "verify[FAILED]: "+msg)
-			if rbErr := t.Rollback(); rbErr != nil {
+			if *keepOnFailure {
+				fmt.Fprintln(humanOut, "keeping edited files (--keep-on-failure)")
+			} else if rbErr := t.Rollback(); rbErr != nil {
 				fmt.Fprintf(stderr, "rollback failed: %v\n", rbErr)
-			} else if !*keepOnFailure {
+			} else {
+				res.Applied = false
 				fmt.Fprintln(humanOut, "restored original files")
 			}
 			res.Error = &editError{Code: 3, Message: msg}
@@ -580,7 +607,7 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 	}
 
 	if *egress != "" && useLLM && client.Enabled() && client.Ping(context.Background()) {
-		if txt, err := client.CallTool(context.Background(), *egress, map[string]any{"description": intent.Description}); err != nil {
+		if txt, err := client.CallTool(context.Background(), *egress, map[string]any{"description": scrubFn(intent.Description)}); err != nil {
 			fmt.Fprintf(stderr, "egress skipped: %v\n", err)
 		} else {
 			fmt.Fprintf(humanOut, "egress[%s]: %s\n", *egress, scrubFn(txt))
@@ -594,6 +621,8 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 	ext := fs.Bool("E", false, "extended regex")
 	count := fs.Bool("c", false, "count matches")
 	jsonOut := fs.Bool("json", false, "emit JSON")
+	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets from matches")
+	fs.BoolVar(showSecrets, "no-scrub", false, "alias for --show-secrets")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -605,6 +634,10 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 	pattern := rest[0]
 	files := rest[1:]
 	recursive := len(files) == 0
+	scrubFn := scrub.Redact
+	if *showSecrets {
+		scrubFn = scrub.NoOp
+	}
 
 	if *count {
 		var n map[string]int
@@ -638,6 +671,9 @@ func runGrep(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+	for i := range lines {
+		lines[i].Text = scrubFn(lines[i].Text)
 	}
 	if *jsonOut {
 		_ = json.NewEncoder(stdout).Encode(map[string]any{"matches": lines})
@@ -678,7 +714,7 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
-		data, _, err := tx.ReadFile(abs)
+		data, _, err := tx.ReadFileLimit(abs, maxFileBytes)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", p, err)
 			return 1
@@ -901,18 +937,27 @@ func exitMessage(code int) string {
 // The list is deliberately conservative and can be overridden explicitly with
 // --allow-protected (which is recorded in the audit log in a future release).
 func isProtected(rel string) bool {
-	rel = filepath.ToSlash(rel)
-	base := filepath.Base(rel)
-	for _, p := range []string{".git/", ".hg/", ".svn/", ".ssh/", ".github/workflows/", ".config/git/"} {
-		if rel == strings.TrimSuffix(p, "/") || strings.HasPrefix(rel, p) {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	// Compare the basename case-insensitively: "makefile" is just as valid to
+	// make as "Makefile", and macOS filesystems are case-insensitive anyway.
+	relLower := strings.ToLower(rel)
+	base := strings.ToLower(filepath.Base(rel))
+	for _, p := range []string{
+		".git/", ".hg/", ".svn/", ".ssh/", ".config/git/",
+		".github/workflows/", ".github/actions/",
+		".husky/", ".git/hooks/", ".gnupg/", ".kube/", ".docker/",
+		".aws/", ".azure/", ".config/gcloud/", ".config/fish/",
+	} {
+		if relLower == strings.TrimSuffix(p, "/") || strings.HasPrefix(relLower, p) {
 			return true
 		}
 	}
 	for _, name := range []string{
-		".env", ".npmrc", ".pypirc", ".netrc", ".bashrc", ".zshrc",
-		".profile", ".bash_profile", ".zprofile", "Jenkinsfile",
-		"Makefile", "GNUmakefile", "Dockerfile", "docker-compose.yml",
-		"docker-compose.yaml", ".gitlab-ci.yml",
+		".env", ".envrc", ".npmrc", ".pypirc", ".netrc", ".bashrc", ".zshrc",
+		".profile", ".bash_profile", ".zprofile", ".gitmodules",
+		".gitconfig", "jenkinsfile", "makefile", "gnumakefile",
+		"docker-compose.yml", "docker-compose.yaml", ".gitlab-ci.yml",
+		".pre-commit-config.yaml", "lefthook.yml",
 	} {
 		if base == name {
 			return true
@@ -921,10 +966,16 @@ func isProtected(rel string) bool {
 	if strings.HasPrefix(base, ".env.") ||
 		strings.HasPrefix(base, "id_rsa") ||
 		strings.HasPrefix(base, "id_ed25519") ||
+		strings.HasPrefix(base, "id_ecdsa") ||
 		strings.HasPrefix(base, "credentials") ||
 		strings.HasPrefix(base, "secrets") ||
+		strings.HasPrefix(base, "dockerfile") ||
+		strings.HasPrefix(base, "containerfile") ||
 		strings.HasSuffix(base, ".pem") ||
 		strings.HasSuffix(base, ".key") ||
+		strings.HasSuffix(base, ".p12") ||
+		strings.HasSuffix(base, ".pfx") ||
+		strings.HasSuffix(base, ".jks") ||
 		strings.HasSuffix(base, ".mk") ||
 		strings.HasPrefix(base, "docker-compose.") {
 		return true
@@ -937,32 +988,6 @@ func confirm(r io.Reader, w io.Writer) bool {
 	line, _ := bufio.NewReader(r).ReadString('\n')
 	line = strings.ToLower(strings.TrimSpace(line))
 	return line == "y" || line == "yes"
-}
-
-// confirmRestore asks whether to roll the edited files back to their .bak
-// originals after a failed verification guard (report-and-ask-to-fix).
-// confirmRestore asks whether to roll the edited files back to their .bak
-// originals after a failed verification guard (report-and-ask-to-fix).
-func confirmRestore(r io.Reader, w io.Writer) bool {
-	fmt.Fprint(w, "verify failed: restore original files from backup? [y/N] ")
-	line, _ := bufio.NewReader(r).ReadString('\n')
-	line = strings.ToLower(strings.TrimSpace(line))
-	return line == "y" || line == "yes"
-}
-
-// isTerminal reports whether r is a character-device terminal (a TTY). Piped
-// or redirected stdin is treated as non-interactive, so the rollback prompt is
-// skipped in scripts and CI.
-func isTerminal(r io.Reader) bool {
-	f, ok := r.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
 }
 
 type stringList []string

@@ -152,3 +152,29 @@ func TestExtractPair(t *testing.T) {
 		}
 	}
 }
+
+// Regex mode is counted with Go's regexp but executed by sed -E, so patterns
+// whose meaning differs between the two engines are rejected.
+func TestValidateRejectsNonPortableRegex(t *testing.T) {
+	bad := []string{`\d+`, `\w+`, `\bword`, `(?P<x>a)`, `a(?=b)`}
+	for _, p := range bad {
+		op := Op{Kind: KindSed, X: p, Y: "x", Regex: true}
+		if err := op.Validate(); err == nil {
+			t.Errorf("regex %q should be rejected", p)
+		}
+	}
+	good := []string{`a[0-9]+`, `^foo\.bar$`, `(a|b){2,3}`}
+	for _, p := range good {
+		op := Op{Kind: KindSed, X: p, Y: "x", Regex: true}
+		if err := op.Validate(); err != nil {
+			t.Errorf("regex %q should be accepted: %v", p, err)
+		}
+	}
+}
+
+func TestValidateRejectsBackslashInScope(t *testing.T) {
+	op := Op{Kind: KindSed, X: "a", Y: "b", Scope: `/x\/`}
+	if err := op.Validate(); err == nil {
+		t.Fatal("a scope containing a backslash should be rejected")
+	}
+}

@@ -18,6 +18,10 @@ import (
 	"time"
 )
 
+// maxResponseBytes bounds an MCP response body. A local server that returns a
+// runaway or malicious body must not exhaust aed's memory.
+const maxResponseBytes = 8 << 20
+
 // Client talks to a Laya MCP endpoint.
 type Client struct {
 	URL     string
@@ -26,6 +30,7 @@ type Client struct {
 	session string
 	id      int64
 	initMu  sync.Mutex
+	sessMu  sync.RWMutex
 	inited  bool
 }
 
@@ -34,7 +39,14 @@ func New(url, token string) *Client {
 	return &Client{
 		URL:   url,
 		Token: token,
-		HTTP:  &http.Client{Timeout: 20 * time.Second},
+		HTTP: &http.Client{
+			Timeout: 20 * time.Second,
+			// Never follow a redirect: the Authorization header must not be
+			// replayed to a different endpoint chosen by the server.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -71,7 +83,7 @@ func (c *Client) ensureInit(ctx context.Context) error {
 	_, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "aed", "version": "0.1.0"},
+		"clientInfo":      map[string]any{"name": "aed", "version": "0.2.0"},
 	})
 	if err != nil {
 		return err
@@ -190,6 +202,21 @@ func (c *Client) Chat(ctx context.Context, query string) (string, error) {
 	return c.CallTool(ctx, name, map[string]any{"query": query})
 }
 
+func (c *Client) sessionID() string {
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.session
+}
+
+func (c *Client) setSession(id string) {
+	if id == "" {
+		return
+	}
+	c.sessMu.Lock()
+	c.session = id
+	c.sessMu.Unlock()
+}
+
 func (c *Client) notify(ctx context.Context, method string, params any) error {
 	payload := map[string]any{"jsonrpc": "2.0", "method": method}
 	if params != nil {
@@ -205,16 +232,17 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	if c.session != "" {
-		req.Header.Set("Mcp-Session-Id", c.session)
+	if sid := c.sessionID(); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		c.session = sid
+	c.setSession(resp.Header.Get("Mcp-Session-Id"))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("mcp %s: HTTP %d", method, resp.StatusCode)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
@@ -237,8 +265,8 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	if c.session != "" {
-		req.Header.Set("Mcp-Session-Id", c.session)
+	if sid := c.sessionID(); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
 	}
 
 	resp, err := c.HTTP.Do(req)
@@ -246,10 +274,14 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		c.session = sid
+	c.setSession(resp.Header.Get("Mcp-Session-Id"))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
 	}
-	data, _ := io.ReadAll(resp.Body)
+	if len(data) > maxResponseBytes {
+		return nil, fmt.Errorf("mcp %s: response exceeds %d bytes", method, maxResponseBytes)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("mcp %s: HTTP %d: %s", method, resp.StatusCode, strings.TrimSpace(string(data)))
 	}

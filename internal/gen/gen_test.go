@@ -55,7 +55,8 @@ func TestGenerateReplaceEscapesDelimiter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := res.Ops[0].Script; got != "s|a\\|b|c\\|d|g" {
+	// The delimiter is chosen to avoid "|", so the literals keep their pipes.
+	if got := res.Ops[0].Script; got != "s#a|b#c|d#g" {
 		t.Errorf("pipe escaping wrong: %q", got)
 	}
 }

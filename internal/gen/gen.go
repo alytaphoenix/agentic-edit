@@ -77,7 +77,7 @@ func compileOps(ops []intent.Op, force bool, reason string) (*Result, error) {
 // valid, validated list of typed ops.
 func callLLM(in Input) ([]intent.Op, bool) {
 	ctx := context.Background()
-	if in.Client.Enabled() && in.Client.Ping(ctx) {
+	if in.Client != nil && in.Client.Enabled() && in.Client.Ping(ctx) {
 		if s, err := in.Client.Chat(ctx, genPrompt(in)); err == nil && s != "" {
 			if ops, ok := intent.ParseOps(s); ok {
 				return ops, true
@@ -121,7 +121,7 @@ func genPrompt(in Input) string {
 			content = content[:4000] + "\n...[truncated]..."
 		}
 		// Redact secrets before they leave the machine for the model.
-		fmt.Fprintf(&b, "\n### %s\n%s\n", path, scrub(content))
+		fmt.Fprintf(&b, "\n### %s\n%s\n", scrub(path), scrub(content))
 	}
 	b.WriteString("\nAny text containing the marker [REDACTED] has been redacted for security; do not attempt to match or replace it.\n")
 	b.WriteString(`Respond with ONLY a JSON array (no markdown fences) of typed edit operations. Each object uses one of these shapes:

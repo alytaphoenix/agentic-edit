@@ -69,8 +69,9 @@ func TestRenderReplaceEscapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// backslash, pipe, and & are all escaped for the s|...|...| form.
-	if eo.Script != `s|a\\b\|c|\&x|g` {
+	// The delimiter is chosen to avoid "|" (present in the pattern), so the
+	// pipe stays literal while backslash and "&" are escaped.
+	if eo.Script != `s#a\\b|c#\&x#g` {
 		t.Errorf("unexpected script: %q", eo.Script)
 	}
 }
@@ -172,5 +173,54 @@ func TestRenderLiteralEscapesRegexMetacharacters(t *testing.T) {
 	}
 	if !eo.Literal {
 		t.Fatal("expected Literal=true")
+	}
+}
+
+// A regex replace must reach sed intact: backslashes are regex syntax, not
+// something to double, and the op is rendered for sed -E (Extended).
+func TestRenderRegexReplacePreservesEscapes(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, X: `a\.b`, Y: "X", Regex: true, Global: true}
+	eo, err := Render(op, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eo.Extended {
+		t.Fatal("regex replace must set Extended (sed -E)")
+	}
+	if eo.Script != `s|a\.b|X|g` {
+		t.Fatalf("script = %q, want s|a\\.b|X|g", eo.Script)
+	}
+	if !strings.Contains(eo.Script, `\.`) {
+		t.Fatalf("regex escape was lost: %q", eo.Script)
+	}
+}
+
+func TestRenderDeleteSetsForceGate(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, Pattern: "^"}
+	if _, err := Render(op, false); err == nil {
+		t.Fatal("expected a whole-file delete to require --force")
+	}
+	eo, err := Render(op, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eo.DeleteAllAllowed {
+		t.Fatal("--force must be propagated to the delete gate")
+	}
+}
+
+// A regex alternation must survive: the delimiter is chosen so the "|" is not
+// escaped into a literal pipe.
+func TestRenderRegexAlternationKeepsPipe(t *testing.T) {
+	op := intent.Op{Kind: intent.KindSed, X: "foo|bar", Y: "x", Regex: true}
+	eo, err := Render(op, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(eo.Script, `\|`) {
+		t.Fatalf("alternation was escaped: %q", eo.Script)
+	}
+	if !strings.Contains(eo.Script, "foo|bar") {
+		t.Fatalf("pattern missing from script: %q", eo.Script)
 	}
 }

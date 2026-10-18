@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 )
 
 // Decider is the subset of laya.Client used here, so tests and other backends
@@ -58,10 +59,11 @@ type Verdict struct {
 // Allowed reports whether the verdict permits the edit under the given
 // threshold. A low-confidence answer is never treated as allow.
 func (v Verdict) Allowed(threshold float64) bool {
-	if v.Risk != "allow" {
+	if canonicalRisk(v.Risk) != "allow" {
 		return false
 	}
-	if v.Confidence > 0 && v.Confidence < threshold {
+	// Missing or zero confidence means "unknown", never a confident allow.
+	if v.Confidence <= 0 || v.Confidence < threshold {
 		return false
 	}
 	return !v.Destructive && !v.ScopeCreep && !v.SecretExposure
@@ -122,10 +124,7 @@ func Check(ctx context.Context, d Decider, state map[string]any, opts Options) (
 		return Verdict{}, fmt.Errorf("decode laya decision: %w", err)
 	}
 	v := Verdict{Raw: raw}
-	v.Risk = stringValue(out.Values["risk"])
-	if v.Risk == "" {
-		v.Risk = "review"
-	}
+	v.Risk = canonicalRisk(stringValue(out.Values["risk"]))
 	v.Confidence = floatValue(out.AnswerConf["risk"])
 	if v.Confidence == 0 {
 		v.Confidence = floatValue(out.Conf["risk"])
@@ -158,10 +157,12 @@ func Threshold(v float64) float64 {
 // Normalize turns a raw decision into the conservative policy outcome. It is
 // exported so callers can apply the same rules to a stored verdict.
 func Normalize(v Verdict, threshold float64, requireIntent bool) Verdict {
-	if v.Risk == "" {
-		v.Risk = "review"
-	}
-	if v.Confidence > 0 && v.Confidence < threshold && v.Risk == "allow" {
+	// Canonicalize first: an unknown/typo'd risk value must never behave like
+	// "allow" in the caller's switch. Anything unrecognized becomes review.
+	v.Risk = canonicalRisk(v.Risk)
+	// A missing confidence is treated as unknown (0), not as certainty. Both a
+	// zero and a below-threshold confidence downgrade an allow to review.
+	if (v.Confidence <= 0 || v.Confidence < threshold) && v.Risk == "allow" {
 		v.Risk = "review"
 		if v.Reason == "" {
 			v.Reason = "laya confidence below the review threshold"
@@ -179,6 +180,22 @@ func Normalize(v Verdict, threshold float64, requireIntent bool) Verdict {
 		}
 	}
 	return v
+}
+
+// canonicalRisk maps a decoded risk answer onto the three policy outcomes.
+// Unknown, empty, or malformed values degrade to "review" (fail closed); common
+// denial synonyms degrade to "block".
+func canonicalRisk(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "allow":
+		return "allow"
+	case "review", "ask", "uncertain":
+		return "review"
+	case "block", "blocked", "deny", "denied", "unsafe":
+		return "block"
+	default:
+		return "review"
+	}
 }
 
 func stringValue(v any) string {

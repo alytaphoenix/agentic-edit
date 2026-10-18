@@ -42,7 +42,32 @@ var formatRe = []struct {
 		name: "connection_string",
 		re:   regexp.MustCompile(`(?i)(?:postgres|postgresql|mysql|mongodb\+srv|mongodb|redis|amqp)://[^\s:@/]+:[^\s:@/]+@`),
 	},
+	{
+		name: "openai_key",
+		re:   regexp.MustCompile(`\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}`),
+	},
+	{
+		name: "gitlab_token",
+		re:   regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}`),
+	},
+	{
+		name: "google_api_key",
+		re:   regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}`),
+	},
+	{
+		name: "stripe_key",
+		re:   regexp.MustCompile(`\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{10,}`),
+	},
+	{
+		name: "jwt",
+		re:   regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`),
+	},
 }
+
+// quotedAssignRe redacts a quoted value assigned to a sensitive key, including
+// values that contain spaces or punctuation. It runs before assignRe so the
+// whole quoted value is replaced rather than just its first token.
+var quotedAssignRe = regexp.MustCompile(`(?i)(\b(?:password|passwd|secret|api[_-]?key|apikey|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|credential|token)\b[^:=<> ]{0,40}\s*[:=]\s*["'])([^"'\n]{4,})(["'])`)
 
 // assignRe is a heuristic that redacts the *value* assigned to a sensitive key.
 // Group 1 (the key name and operator) is preserved; only the value is replaced.
@@ -56,6 +81,7 @@ func Redact(s string) string {
 	for _, f := range formatRe {
 		s = f.re.ReplaceAllString(s, fmt.Sprintf(Marker, f.name))
 	}
+	s = quotedAssignRe.ReplaceAllString(s, "${1}"+fmt.Sprintf(Marker, "credential")+"${3}")
 	s = assignRe.ReplaceAllString(s, "${1}"+fmt.Sprintf(Marker, "credential"))
 	return s
 }

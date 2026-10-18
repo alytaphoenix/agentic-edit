@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
-	"io"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,55 +131,6 @@ func TestGuardFailureRollsBackAndExits3(t *testing.T) {
 	}
 	if !strings.Contains(out, "restored original files") {
 		t.Errorf("expected automatic rollback, out=%q", out)
-	}
-}
-
-// confirmRestore accepts y/yes (case-insensitive) and rejects everything else.
-func TestConfirmRestore(t *testing.T) {
-	cases := map[string]bool{
-		"y\n":      true,
-		"yes\n":    true,
-		"Y\n":      true,
-		"  yes \n": true,
-		"n\n":      false,
-		"no\n":     false,
-		"\n":       false,
-		"trash\n":  false,
-	}
-	for in, want := range cases {
-		if got := confirmRestore(strings.NewReader(in), io.Discard); got != want {
-			t.Errorf("confirmRestore(%q)=%v, want %v", in, got, want)
-		}
-	}
-}
-
-// isTerminal is false for non-file readers and for regular files, and true for
-// character devices such as /dev/null.
-func TestIsTerminal(t *testing.T) {
-	if isTerminal(strings.NewReader("x")) {
-		t.Error("strings.Reader should not be a terminal")
-	}
-	dir := t.TempDir()
-	fpath := filepath.Join(dir, "f.txt")
-	if err := os.WriteFile(fpath, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(fpath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if isTerminal(f) {
-		t.Error("a regular file should not be a terminal")
-	}
-	// /dev/null is a character device on macOS; treat its absence gracefully.
-	nd, err := os.Open("/dev/null")
-	if err != nil {
-		t.Skipf("/dev/null unavailable: %v", err)
-	}
-	defer nd.Close()
-	if !isTerminal(nd) {
-		t.Error("/dev/null should be detected as a terminal (char device)")
 	}
 }
 
@@ -355,5 +308,132 @@ func TestJSONResult(t *testing.T) {
 	files, _ := got["files"].([]any)
 	if len(files) != 1 {
 		t.Fatalf("expected one file, got %v", got["files"])
+	}
+}
+
+// fakeLaya starts an MCP server that answers laya_decide with the given risk
+// and confidence, so the safety gate can be exercised end to end.
+func fakeLaya(t *testing.T, risk string, confidence float64) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{}}`, req.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			decision := fmt.Sprintf(`{"values":{"risk":%q,"intent_match":3,"destructive":false,"scope_creep":false,"secret_exposure":false},"answer_confidence":{"risk":%v}}`, risk, confidence)
+			result, _ := json.Marshal(map[string]any{
+				"content": []map[string]any{{"type": "text", "text": decision}},
+			})
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, result)
+		default:
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{}}`, req.ID)
+		}
+	}))
+}
+
+func TestLayaBlockModeDeniesReview(t *testing.T) {
+	srv := fakeLaya(t, "review", 0.9)
+	defer srv.Close()
+	dir := t.TempDir()
+	path := writeLine(t, dir, `name = "v1"`)
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y",
+		"--laya-safety=block", "--laya-url", srv.URL)
+	if code != 5 {
+		t.Fatalf("exit=%d, want 5; out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); strings.TrimSpace(string(got)) != `name = "v1"` {
+		t.Fatalf("blocked edit changed the file: %q", got)
+	}
+}
+
+func TestLayaWarnModeAppliesOnBlock(t *testing.T) {
+	srv := fakeLaya(t, "block", 0.99)
+	defer srv.Close()
+	dir := t.TempDir()
+	path := writeLine(t, dir, `name = "v1"`)
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y",
+		"--laya-safety=warn", "--laya-url", srv.URL)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); strings.TrimSpace(string(got)) != `name = "v3"` {
+		t.Fatalf("warn mode did not apply: %q", got)
+	}
+}
+
+func TestLayaBlockModeAppliesOnConfidentAllow(t *testing.T) {
+	srv := fakeLaya(t, "allow", 0.99)
+	defer srv.Close()
+	dir := t.TempDir()
+	path := writeLine(t, dir, `name = "v1"`)
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y",
+		"--laya-safety=block", "--laya-url", srv.URL)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; out=%q", code, out)
+	}
+}
+
+func TestInvalidLayaSafetyIsUsageError(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLine(t, dir, `name = "v1"`)
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y", "--laya-safety=blok")
+	if code != 2 {
+		t.Fatalf("exit=%d, want 2; out=%q", code, out)
+	}
+}
+
+// A symlinked --root must not hide a protected path: the relative path used for
+// the policy check has to be computed against the resolved root.
+func TestProtectedPathWithSymlinkedRoot(t *testing.T) {
+	realDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(realDir, ".env"), []byte("TOKEN=v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkRoot := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(realDir, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(linkRoot, ".env")
+	var out, errb bytes.Buffer
+	code := Run([]string{"edit", "--root", linkRoot, "--action", `replace "v1" with "v2"`, "-f", path, "-y"},
+		strings.NewReader("n"), &out, &errb)
+	if code != 5 {
+		t.Fatalf("exit=%d, want 5; stdout=%q stderr=%q", code, out.String(), errb.String())
+	}
+}
+
+// grep output is file content, so secrets must be redacted by default just as
+// they are in edit diffs. --show-secrets opts out.
+func TestGrepRedactsSecretsByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	secret := "AKIA1234567890ABCDEF"
+	if err := os.WriteFile(path, []byte("key = "+secret+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := Run([]string{"grep", "key", path}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, errb.String())
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Fatalf("grep leaked a secret: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "[REDACTED") {
+		t.Fatalf("expected a redaction marker: %q", out.String())
+	}
+
+	out.Reset()
+	if code := Run([]string{"grep", "--show-secrets", "key", path}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, errb.String())
+	}
+	if !strings.Contains(out.String(), secret) {
+		t.Fatalf("--show-secrets should emit the raw value: %q", out.String())
 	}
 }

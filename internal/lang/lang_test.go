@@ -3,29 +3,8 @@ package lang
 import (
 	"context"
 	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
 )
-
-type stubChecker struct {
-	name  string
-	exts  []string
-	diags []Diagnostic
-	err   error
-	calls int
-}
-
-func (s *stubChecker) Name() string { return s.name }
-func (s *stubChecker) Applies(path, content string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	for _, e := range s.exts {
-		if strings.ToLower(e) == ext {
-			return true
-		}
-	}
-	return false
-}
 
 func TestShebangInterpreterParsing(t *testing.T) {
 	cases := []struct{ content, want string }{

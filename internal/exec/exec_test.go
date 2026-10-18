@@ -156,36 +156,80 @@ func TestSearchFixed(t *testing.T) {
 	}
 }
 
-// Rollback restores a file from its .bak backup and leaves no temp file behind.
-func TestRollbackRestoresBackup(t *testing.T) {
+// A pattern beginning with "-" must be treated as data, not as a grep option.
+// Before "--" was added, a pattern such as "-f/etc/passwd" made grep read
+// patterns from an arbitrary file (or "-r" silently changed traversal).
+func TestGrepPatternCannotInjectOptions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.txt")
-	original := "keep this line\n"
-	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("-x\nplain\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate a backup taken before an edit, then a destructive edit.
-	if err := os.WriteFile(path+".bak", []byte(original), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte("totally changed\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A leftover temp file should also be cleaned up.
-	if err := os.WriteFile(path+".aed.tmp", []byte("junk"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	Rollback(path)
-
-	got, err := os.ReadFile(path)
+	lines, err := Search("-x", []string{path}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != original {
-		t.Errorf("rollback did not restore original: got %q", string(got))
+	if len(lines) != 1 || lines[0].Text != "-x" {
+		t.Fatalf("Search(-x) = %+v, want one match", lines)
 	}
-	if _, err := os.Stat(path + ".aed.tmp"); !os.IsNotExist(err) {
-		t.Errorf("expected temp file to be removed, stat err=%v", err)
+	// A missing file named like an option must fail rather than being treated
+	// as a flag.
+	if _, err := Search("plain", []string{"--include=*"}, false); err == nil {
+		t.Fatal("expected grep to reject a non-existent option-shaped filename")
+	}
+}
+
+// Regex replaces run through sed -E, and an escaped metacharacter keeps its
+// meaning instead of being doubled into a literal backslash.
+func TestDryRunRegexReplaceUsesExtendedSed(t *testing.T) {
+	op := EditOp{Kind: KindSed, Script: `s|a\.b|X|g`, Extended: true, Old: `a\.b`, New: "X", Literal: false}
+	out, err := DryRun(op, "a.b\naxb\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "X\naxb\n" {
+		t.Fatalf("out = %q, want %q", out, "X\naxb\n")
+	}
+}
+
+// A broad delete that removes every line is gated on the actual result, so a
+// pattern that slips past the compile-time denylist (e.g. "^.*$") still needs
+// --force.
+func TestDryRunBlocksWholeFileDelete(t *testing.T) {
+	op := EditOp{Kind: KindSed, Script: `/^.*$/d`, Pattern: "^.*$", Deny: "^.*$", DenyRegex: true}
+	if _, err := DryRun(op, "a\nb\n"); err == nil {
+		t.Fatal("expected a whole-file delete to be refused")
+	}
+	op.DeleteAllAllowed = true
+	out, err := DryRun(op, "a\nb\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want empty", out)
+	}
+}
+
+// The unique-match default applies to regex replaces too: two matches must be
+// rejected before sed runs.
+func TestDryRunRegexExpectCount(t *testing.T) {
+	op := EditOp{Kind: KindSed, Script: `s|v[0-9]|x|g`, Extended: true, Old: `v[0-9]`, Literal: false, ExpectCount: 1}
+	if _, err := DryRun(op, "v1\nv2\n"); err == nil {
+		t.Fatal("expected two regex matches to be rejected when one is required")
+	}
+	op.ExpectCount = 2
+	if _, err := DryRun(op, "v1\nv2\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDryRunRegexAlternation(t *testing.T) {
+	op := EditOp{Kind: KindSed, Script: `s#foo|bar#x#g`, Extended: true, Literal: false}
+	out, err := DryRun(op, "foo\nbar\nbaz\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "x\nx\nbaz\n" {
+		t.Fatalf("out = %q", out)
 	}
 }

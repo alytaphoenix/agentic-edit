@@ -7,6 +7,7 @@ package intent
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -88,6 +89,11 @@ func (o Op) Validate() error {
 			if o.Scope != "" && !isAddr(o.Scope) {
 				return fmt.Errorf("invalid sed address %q", o.Scope)
 			}
+			if o.Regex {
+				if err := validateRegex(o.X); err != nil {
+					return err
+				}
+			}
 		}
 		if o.SedAction() == "delete" && o.Pattern == "" {
 			return fmt.Errorf("sed delete requires a pattern")
@@ -129,10 +135,28 @@ func isAddr(s string) bool {
 	// and hash are command separators/control characters in sed; allowing them
 	// inside the "address" let an LLM emit something like "/x/;e id;/y/" and
 	// execute a shell command on GNU sed. Reject them outright.
-	if strings.ContainsAny(s, "\r\n;{}!#") {
+	if strings.ContainsAny(s, "\r\n;{}!#\\") {
 		return false
 	}
 	return true
+}
+
+// nonPortableRegex matches constructs that Go's regexp accepts but POSIX ERE
+// (sed -E) does not. The count guard is evaluated with Go's regexp, so allowing
+// these would let the guard and sed disagree about what matches — exactly the
+// kind of divergence that turns a "unique replace" into a broad one.
+var nonPortableRegex = regexp.MustCompile(`\\[dDwWsSbBAzZpPxQE]|\(\?`)
+
+// validateRegex rejects a regex that sed -E and the Go count guard would
+// interpret differently.
+func validateRegex(p string) error {
+	if nonPortableRegex.MatchString(p) {
+		return fmt.Errorf("regex %q uses a construct that is not portable to sed -E", p)
+	}
+	if _, err := regexp.Compile(p); err != nil {
+		return fmt.Errorf("invalid regex %q: %v", p, err)
+	}
+	return nil
 }
 
 // Parse turns a natural-language instruction into a list of typed Ops using a
