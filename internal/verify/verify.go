@@ -15,6 +15,7 @@ import (
 	"agentic-edit/internal/exec"
 	"agentic-edit/internal/gen"
 	"agentic-edit/internal/laya"
+	"agentic-edit/internal/native"
 )
 
 // Result summarizes a verification pass.
@@ -77,7 +78,15 @@ func Run(res *gen.Result, before, after map[string]string, client *laya.Client, 
 				continue
 			}
 
-			res2, err := exec.DryRun(replayOp(op), state[f])
+			var res2 string
+			var err error
+			if op.Action == "" {
+				// Legacy ops without action metadata are replayed with the sed
+				// backend; ops produced by the current generator use native.
+				res2, err = exec.DryRun(replayOp(op), state[f])
+			} else {
+				res2, err = native.Apply(replayOp(op), state[f])
+			}
 			if err == nil && res2 == state[f] {
 				// This op changed nothing on this file → no assertion applies.
 				continue

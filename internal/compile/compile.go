@@ -41,6 +41,7 @@ func Render(op intent.Op, force bool) (exec.EditOp, error) {
 	case intent.KindGrep:
 		eo = exec.EditOp{
 			Kind:    exec.KindGrep,
+			Action:  "grep",
 			Pattern: op.Pattern,
 			Purpose: "find lines matching " + op.Pattern,
 		}
@@ -65,11 +66,13 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 		}
 		eo := exec.EditOp{
 			Kind:        exec.KindSed,
+			Action:      "replace",
 			Script:      script,
 			Assert:      op.Y,
 			Old:         op.X,
 			New:         op.Y,
 			Literal:     literal,
+			Global:      global,
 			Extended:    !literal, // regex replaces are POSIX ERE via sed -E
 			ExpectCount: op.ExpectCount,
 			Purpose:     fmt.Sprintf("replace %q with %q", op.X, op.Y),
@@ -91,10 +94,14 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 			pos = "before"
 		}
 		return exec.EditOp{
-			Kind:    exec.KindSed,
-			Script:  script,
-			Assert:  op.Text,
-			Purpose: fmt.Sprintf("insert %q %s anchor %q", op.Text, pos, op.Anchor),
+			Kind:         exec.KindSed,
+			Action:       "insert",
+			Anchor:       op.Anchor,
+			Text:         op.Text,
+			InsertBefore: op.InsertBefore,
+			Script:       script,
+			Assert:       op.Text,
+			Purpose:      fmt.Sprintf("insert %q %s anchor %q", op.Text, pos, op.Anchor),
 		}, nil
 	case "delete":
 		if matchAllRe.MatchString(op.Pattern) && !force {
@@ -106,6 +113,7 @@ func renderSed(op intent.Op, force bool) (exec.EditOp, error) {
 		}
 		return exec.EditOp{
 			Kind:             exec.KindSed,
+			Action:           "delete",
 			Script:           script,
 			Pattern:          op.Pattern, // marks this as a delete op
 			Deny:             op.Pattern, // the deleted pattern must be absent
@@ -123,9 +131,11 @@ func renderAwk(op intent.Op) (exec.EditOp, error) {
 		return exec.EditOp{}, fmt.Errorf("unknown awk transform %q", op.Transform)
 	}
 	return exec.EditOp{
-		Kind:    exec.KindAwk,
-		Script:  prog,
-		Purpose: "awk " + op.Transform,
+		Kind:      exec.KindAwk,
+		Action:    "transform",
+		Transform: op.Transform,
+		Script:    prog,
+		Purpose:   "awk " + op.Transform,
 	}, nil
 }
 

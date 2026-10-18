@@ -38,11 +38,23 @@ type EditOp struct {
 	Deny    string // grep pattern that must be absent after apply
 	Purpose string // human-readable description
 
+	// Action is the normalized edit action: replace, insert, delete, or
+	// transform. It lets a native engine apply the op without parsing Script.
+	Action string
+	// Insert fields.
+	Anchor       string
+	Text         string
+	InsertBefore bool
+	FirstOnly    bool // insert only before/after the first matching line
+	// Transform is the awk transform name ("upper" or "lower").
+	Transform string
+
 	// Optional preflight fields. They let the dry-run reject a replace that
 	// would hit an unexpected number of occurrences before any edit runs.
 	Old         string // literal or regex value being replaced
 	New         string // replacement value
 	Literal     bool   // Old is a literal string (default for replace)
+	Global      bool   // replace every match (not just the first per line)
 	Extended    bool   // regex replaces are rendered for sed -E (POSIX ERE)
 	ExpectCount int    // 0 = no count check; >0 = exact number of matches
 	DenyRegex   bool   // Deny is a regex (delete ops) rather than a literal
