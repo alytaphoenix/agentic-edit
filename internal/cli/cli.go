@@ -5,6 +5,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -15,29 +16,39 @@ import (
 	"strings"
 	"time"
 
+	"agentic-edit/internal/applyplan"
+	"agentic-edit/internal/audit"
 	"agentic-edit/internal/exec"
 	"agentic-edit/internal/gen"
+	"agentic-edit/internal/ir"
 	"agentic-edit/internal/lang"
 	"agentic-edit/internal/laya"
+	"agentic-edit/internal/layaeval"
 	"agentic-edit/internal/layasafety"
+	"agentic-edit/internal/mcp"
+	"agentic-edit/internal/native"
 	"agentic-edit/internal/plan"
+	"agentic-edit/internal/policy"
 	"agentic-edit/internal/safety"
 	"agentic-edit/internal/scrub"
 	"agentic-edit/internal/tx"
 	"agentic-edit/internal/verify"
 )
 
-// maxFileBytes caps how large a target file may be. Files above this (or that
-// look binary) are rejected up front.
-const maxFileBytes = 50 * 1024 * 1024
-
 // Version is the CLI version reported by `aed version`.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 const usageText = `aed — agentic file editing with awk/sed/grep + Laya
 
 Usage:
   aed edit   -a "instruction" -f FILE [-f FILE...] [options]
+  aed plan   --ops OPS.json [--out PLAN.json] [--json]
+  aed apply  --plan PLAN.json --expect-digest DIGEST -y [--json]
+  aed mcp    [--root DIR] [--allow-write]
+  aed laya-eval --corpus FILE [--json]
+  aed log    [--json] [-n N] [--verify]
+  aed undo   [--tx ID] [--root DIR] [--json]
+  aed recover [--root DIR] [--json]
   aed check  [--json] FILE [FILE...]
   aed grep   [-E] [-c] [--json] [--show-secrets] PATTERN [FILE...]
   aed list-laya-tools [--laya-url URL] [--laya-token TOKEN]
@@ -64,6 +75,7 @@ edit options:
   --laya-safety-threshold  Review below this confidence (default: 0.65)
   --show-secrets   Do not redact secrets from LLM prompts and output (alias: --no-scrub)
   --allow-protected  Allow editing protected paths (.git, CI, keys, .env, ...)
+  --allow-ignored    Allow editing paths matched by .aedignore
   --force          Allow whole-file destructive deletes (e.g. delete matching .)
   --root           Workspace root for path confinement (default: current dir)
   --laya-url       Laya MCP URL (default http://127.0.0.1:8420/mcp/)
@@ -84,6 +96,20 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "edit":
 		return runEdit(args[1:], stdin, stdout, stderr)
+	case "plan":
+		return runPlan(args[1:], stdout, stderr)
+	case "apply":
+		return runApply(args[1:], stdout, stderr)
+	case "mcp":
+		return runMCP(args[1:], stdin, stdout, stderr)
+	case "laya-eval":
+		return runLayaEval(args[1:], stdout, stderr)
+	case "log":
+		return runLog(args[1:], stdout, stderr)
+	case "undo":
+		return runUndo(args[1:], stdout, stderr)
+	case "recover":
+		return runRecover(args[1:], stdout, stderr)
 	case "check":
 		return runCheck(args[1:], stdout, stderr)
 	case "grep":
@@ -138,7 +164,9 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 	unique := fs.Bool("unique", true, "require exactly one match for each replace")
 	all := fs.Bool("all", false, "allow a replace to match more than once")
 	allowProtected := fs.Bool("allow-protected", false, "allow editing protected paths")
+	allowIgnored := fs.Bool("allow-ignored", false, "allow editing paths listed in .aedignore")
 	keepOnFailure := fs.Bool("keep-on-failure", false, "keep the edit if verification fails")
+	engine := fs.String("engine", "native", "edit engine: native or sed")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -188,6 +216,12 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		res.Error = &editError{Code: 2, Message: msg}
 		return 2
 	}
+	if *engine != "native" && *engine != "sed" {
+		msg := fmt.Sprintf("invalid --engine %q (want native or sed)", *engine)
+		fmt.Fprintln(stderr, "error: "+msg)
+		res.Error = &editError{Code: 2, Message: msg}
+		return 2
+	}
 	if *safetyThreshold < 0 || *safetyThreshold > 1 {
 		msg := fmt.Sprintf("invalid --laya-safety-threshold %v (want 0..1)", *safetyThreshold)
 		fmt.Fprintln(stderr, "error: "+msg)
@@ -203,9 +237,12 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 	// Resolve the root once so protected-path checks compare against the same
 	// real tree that confine() enforces. Using an unresolved root here let a
 	// --root symlink hide a protected path behind a "../" relative name.
-	rootForRel, _ := filepath.Abs(root)
-	if realRoot, err := filepath.EvalSymlinks(rootForRel); err == nil {
-		rootForRel = realRoot
+	limits := policy.DefaultLimits()
+	ignored, err := policy.LoadIgnore(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: cannot read .aedignore: %v\n", err)
+		res.Error = &editError{Code: 1, Message: err.Error()}
+		return 1
 	}
 
 	// scrubFn redacts secrets from LLM prompts and stdout unless --show-secrets.
@@ -223,25 +260,28 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 	origMode := map[string]os.FileMode{}
 	origHash := map[string]string{}
 	for _, f := range files {
-		real, err := confine(f, root)
+		real, rel, err := policy.Confine(root, f)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
-		if rel, err := filepath.Rel(rootForRel, real); err == nil && isProtected(rel) && !*allowProtected {
-			msg := fmt.Sprintf("%q is a protected path; re-run with --allow-protected to edit it", f)
-			fmt.Fprintf(stderr, "policy: %s\n", msg)
-			res.Error = &editError{Code: 5, Message: msg}
-			return 5
+		if err := policy.CheckPath(rel, *allowProtected, *allowIgnored, ignored); err != nil {
+			fmt.Fprintf(stderr, "policy: %v\n", err)
+			code := 1
+			if policy.IsDenied(err) {
+				code = 5
+			}
+			res.Error = &editError{Code: code, Message: err.Error()}
+			return code
 		}
-		data, mode, err := tx.ReadFileLimit(real, maxFileBytes)
+		data, mode, err := tx.ReadFileLimit(real, limits.MaxFileBytes)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", real, err)
 			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
-		if err := checkText(real, data); err != nil {
+		if err := policy.CheckText(real, data, limits.MaxFileBytes); err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
@@ -348,7 +388,13 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 			if op.Path != "" && op.Path != f {
 				continue
 			}
-			o, err := exec.DryRun(op, out)
+			var o string
+			var err error
+			if *engine == "native" {
+				o, err = native.Apply(op, out)
+			} else {
+				o, err = exec.DryRun(op, out)
+			}
 			if err != nil {
 				fmt.Fprintf(stderr, "error: %s failed: %v\n", f, err)
 				res.Error = &editError{Code: 1, Message: err.Error()}
@@ -360,13 +406,21 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 	}
 
 	changedFiles := 0
+	totalBytes := 0
+	changedLines := 0
+	deletions := 0
+	var diffBytes int64
 	for _, f := range confined {
+		totalBytes += len(contents[f]) + len(after[f])
 		d := exec.LineDiff(contents[f], after[f])
 		changed := hasDiff(d)
 		if changed {
 			changedFiles++
 		}
 		added, removed := diffStats(d)
+		changedLines += added + removed
+		deletions += removed
+		diffBytes += int64(len(d))
 		res.Files = append(res.Files, editFile{
 			Path:      f,
 			BeforeSHA: origHash[f],
@@ -381,6 +435,12 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		} else {
 			fmt.Fprintf(humanOut, "--- %s\n%s", f, scrubFn(d))
 		}
+	}
+
+	if err := limits.CheckLimits(len(confined), int64(totalBytes), changedLines, deletions, diffBytes); err != nil {
+		fmt.Fprintf(stderr, "policy: %v\n", err)
+		res.Error = &editError{Code: 5, Message: err.Error()}
+		return 5
 	}
 
 	// Syntax gate: parse the edited result with each language's own checker
@@ -439,13 +499,13 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 				}
 				d := exec.LineDiff(contents[f], after[f])
 				added, removed := diffStats(d)
-				relForFlags, _ := filepath.Rel(rootForRel, f)
+				_, relForFlags, _ := policy.Confine(root, f)
 				state := map[string]any{
 					"instruction": scrubFn(intent.Description),
 					"path":        scrubFn(filepath.ToSlash(relForFlags)),
 					"diff":        scrubFn(d),
 					"stats":       fmt.Sprintf("+%d -%d", added, removed),
-					"flags":       fmt.Sprintf("syntax=checked; protected=%t", isProtected(relForFlags)),
+					"flags":       fmt.Sprintf("syntax=checked; protected=%t", policy.IsProtected(relForFlags)),
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				v, err := layasafety.Check(ctx, client, state, layasafety.Options{
@@ -532,6 +592,8 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		return 6
 	}
 	defer t.Cleanup()
+	var entries []audit.FileEntry
+	beforeBytes := map[string][]byte{}
 	for _, f := range confined {
 		if after[f] == contents[f] {
 			continue
@@ -541,8 +603,23 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 			res.Error = &editError{Code: 1, Message: err.Error()}
 			return 1
 		}
+		rel, _ := filepath.Rel(t.Root, f)
+		entries = append(entries, audit.FileEntry{
+			Path: filepath.ToSlash(rel), Action: "update", BeforeSHA: origHash[f],
+			AfterSHA: tx.Hash([]byte(after[f])), Mode: uint32(origMode[f].Perm()),
+		})
+		beforeBytes[filepath.ToSlash(rel)] = []byte(contents[f])
+	}
+	journal, err := audit.Begin(t.ID, t.Root, "", entries, beforeBytes)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: audit journal: %v\n", err)
+		res.Error = &editError{Code: 1, Message: "audit journal: " + err.Error()}
+		return 1
 	}
 	if err := t.Commit(); err != nil {
+		if !t.NeedsRecovery() {
+			journal.Abort()
+		}
 		code := 1
 		if strings.Contains(err.Error(), "conflict") {
 			code = 6
@@ -550,6 +627,15 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		res.Error = &editError{Code: code, Message: err.Error()}
 		return code
+	}
+	if err := journal.Commit(); err != nil {
+		fmt.Fprintf(stderr, "warning: could not finalize audit journal: %v\n", err)
+	}
+	if _, err := audit.Append(audit.Record{
+		Kind: "apply", TXID: t.ID, Root: t.Root, Tool: "aed",
+		Instruction: scrubFn(*action), Files: entries,
+	}); err != nil {
+		fmt.Fprintf(stderr, "warning: could not append audit record: %v\n", err)
 	}
 	res.Applied = true
 	res.TXID = t.ID
@@ -575,6 +661,8 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 				fmt.Fprintf(stderr, "rollback failed: %v\n", rbErr)
 			} else {
 				res.Applied = false
+				journal.Abort()
+				_, _ = audit.Append(audit.Record{Kind: "rollback", TXID: t.ID, Root: t.Root, Tool: "aed", Files: entries, Message: msg})
 				fmt.Fprintln(humanOut, "restored original files")
 			}
 			res.Error = &editError{Code: 3, Message: msg}
@@ -599,6 +687,8 @@ func runEdit(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int
 				fmt.Fprintf(stderr, "rollback failed: %v\n", rbErr)
 			} else {
 				res.Applied = false
+				journal.Abort()
+				_, _ = audit.Append(audit.Record{Kind: "rollback", TXID: t.ID, Root: t.Root, Tool: "aed", Files: entries, Message: msg})
 				fmt.Fprintln(humanOut, "restored original files")
 			}
 			res.Error = &editError{Code: 3, Message: msg}
@@ -714,12 +804,12 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
-		data, _, err := tx.ReadFileLimit(abs, maxFileBytes)
+		data, _, err := tx.ReadFileLimit(abs, policy.DefaultLimits().MaxFileBytes)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: cannot read %s: %v\n", p, err)
 			return 1
 		}
-		if err := checkText(abs, data); err != nil {
+		if err := policy.CheckText(abs, data, policy.DefaultLimits().MaxFileBytes); err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
@@ -784,56 +874,6 @@ func listLayaTools(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%-24s %s\n", t.Name, t.Description)
 	}
 	return 0
-}
-
-// confine resolves path against the workspace root and refuses anything that
-// escapes it (via .. or symlinks). It returns the resolved real path.
-func confine(path, root string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	// Refuse to edit a path whose final component is a symlink. Resolving it
-	// would silently edit a different file; --follow-symlinks is intentionally
-	// not offered in this version.
-	if info, err := os.Lstat(abs); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("%q is a symlink; refusing to edit it", path)
-	}
-	real := abs
-	if _, err := os.Stat(abs); err == nil {
-		if r, err := filepath.EvalSymlinks(abs); err == nil {
-			real = r
-		}
-	}
-	rootAbs, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	rootReal, err := filepath.EvalSymlinks(rootAbs)
-	if err != nil {
-		return "", fmt.Errorf("workspace root %q is not accessible: %v", root, err)
-	}
-	rel, err := filepath.Rel(rootReal, real)
-	if err != nil {
-		return "", err
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", fmt.Errorf("%q is outside the workspace root %q", path, root)
-	}
-	return real, nil
-}
-
-// checkText rejects files that are too large or contain NUL bytes (binary).
-func checkText(name string, data []byte) error {
-	if len(data) > maxFileBytes {
-		return fmt.Errorf("%q exceeds max size %d bytes", name, maxFileBytes)
-	}
-	for _, b := range data {
-		if b == 0 {
-			return fmt.Errorf("%q looks like a binary file (contains a NUL byte)", name)
-		}
-	}
-	return nil
 }
 
 // editResult is the stable machine-readable result emitted by --json.
@@ -932,57 +972,6 @@ func exitMessage(code int) string {
 	}
 }
 
-// isProtected reports whether rel (relative to the workspace root) is a path
-// whose modification commonly leads to code execution or credential exposure.
-// The list is deliberately conservative and can be overridden explicitly with
-// --allow-protected (which is recorded in the audit log in a future release).
-func isProtected(rel string) bool {
-	rel = filepath.ToSlash(filepath.Clean(rel))
-	// Compare the basename case-insensitively: "makefile" is just as valid to
-	// make as "Makefile", and macOS filesystems are case-insensitive anyway.
-	relLower := strings.ToLower(rel)
-	base := strings.ToLower(filepath.Base(rel))
-	for _, p := range []string{
-		".git/", ".hg/", ".svn/", ".ssh/", ".config/git/",
-		".github/workflows/", ".github/actions/",
-		".husky/", ".git/hooks/", ".gnupg/", ".kube/", ".docker/",
-		".aws/", ".azure/", ".config/gcloud/", ".config/fish/",
-	} {
-		if relLower == strings.TrimSuffix(p, "/") || strings.HasPrefix(relLower, p) {
-			return true
-		}
-	}
-	for _, name := range []string{
-		".env", ".envrc", ".npmrc", ".pypirc", ".netrc", ".bashrc", ".zshrc",
-		".profile", ".bash_profile", ".zprofile", ".gitmodules",
-		".gitconfig", "jenkinsfile", "makefile", "gnumakefile",
-		"docker-compose.yml", "docker-compose.yaml", ".gitlab-ci.yml",
-		".pre-commit-config.yaml", "lefthook.yml",
-	} {
-		if base == name {
-			return true
-		}
-	}
-	if strings.HasPrefix(base, ".env.") ||
-		strings.HasPrefix(base, "id_rsa") ||
-		strings.HasPrefix(base, "id_ed25519") ||
-		strings.HasPrefix(base, "id_ecdsa") ||
-		strings.HasPrefix(base, "credentials") ||
-		strings.HasPrefix(base, "secrets") ||
-		strings.HasPrefix(base, "dockerfile") ||
-		strings.HasPrefix(base, "containerfile") ||
-		strings.HasSuffix(base, ".pem") ||
-		strings.HasSuffix(base, ".key") ||
-		strings.HasSuffix(base, ".p12") ||
-		strings.HasSuffix(base, ".pfx") ||
-		strings.HasSuffix(base, ".jks") ||
-		strings.HasSuffix(base, ".mk") ||
-		strings.HasPrefix(base, "docker-compose.") {
-		return true
-	}
-	return false
-}
-
 func confirm(r io.Reader, w io.Writer) bool {
 	fmt.Fprint(w, "Apply these changes? [y/N] ")
 	line, _ := bufio.NewReader(r).ReadString('\n')
@@ -1001,5 +990,484 @@ func (s *stringList) String() string {
 
 func (s *stringList) Set(v string) error {
 	*s = append(*s, v)
+	return nil
+}
+
+// runPlan builds a canonical, digest-bound plan from an ops JSON document.
+func runPlan(args []string, stdout, stderr io.Writer) (code int) {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	opsPath := fs.String("ops", "", "ops JSON file")
+	outPath := fs.String("out", "", "write the plan JSON to this file")
+	rootFlag := fs.String("root", "", "workspace root")
+	jsonOut := fs.Bool("json", false, "emit the plan JSON on stdout")
+	allowProtected := fs.Bool("allow-protected", false, "allow protected paths")
+	allowIgnored := fs.Bool("allow-ignored", false, "allow .aedignore paths")
+	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets from the rendered diff")
+	fs.BoolVar(showSecrets, "no-scrub", false, "alias for --show-secrets")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *opsPath == "" {
+		fmt.Fprintln(stderr, "usage: aed plan --ops OPS.json [--out PLAN.json] [--json]")
+		return 2
+	}
+	if *jsonOut {
+		defer func() {
+			if code == 0 {
+				return
+			}
+			_ = json.NewEncoder(stdout).Encode(map[string]any{
+				"version": 1, "ok": false,
+				"error": map[string]any{"code": code, "message": exitMessage(code)},
+			})
+		}()
+	}
+	root := *rootFlag
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
+		}
+	}
+	data, err := readSmallFile(*opsPath, 2<<20)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	ops, err := ir.Parse(data)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	plan, _, err := applyplan.Build(root, ops, applyplan.Options{
+		AllowProtected: *allowProtected,
+		AllowIgnored:   *allowIgnored,
+	})
+	if err != nil {
+		return reportPlanError(err, stderr)
+	}
+
+	out := stdout
+	if !*showSecrets {
+		for i := range plan.Files {
+			plan.Files[i].Diff = scrub.Redact(plan.Files[i].Diff)
+		}
+	}
+	encoded, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if *outPath != "" {
+		real, rel, err := policy.Confine(root, *outPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: --out: %v\n", err)
+			return 1
+		}
+		if err := policy.CheckPath(rel, *allowProtected, *allowIgnored, nil); err != nil {
+			fmt.Fprintf(stderr, "policy: %v\n", err)
+			return 5
+		}
+		if err := writeFileAtomic(real, append(encoded, '\n'), 0o600); err != nil {
+			fmt.Fprintf(stderr, "error: write plan: %v\n", err)
+			return 1
+		}
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(out).Encode(plan)
+		return 0
+	}
+	for _, f := range plan.Files {
+		fmt.Fprintf(out, "%s %s\n", f.Action, f.Path)
+		if f.Diff != "" {
+			fmt.Fprintf(out, "%s", f.Diff)
+		}
+	}
+	fmt.Fprintf(out, "\nplan digest: %s\n", plan.Digest)
+	if *outPath != "" {
+		fmt.Fprintf(out, "apply with: aed apply --plan %s --expect-digest %s -y\n", *outPath, plan.Digest)
+	} else {
+		fmt.Fprintf(out, "save the plan with --out FILE, then: aed apply --plan FILE --expect-digest %s -y\n", plan.Digest)
+	}
+	return 0
+}
+
+// runApply revalidates a plan and commits it atomically.
+func runApply(args []string, stdout, stderr io.Writer) (code int) {
+	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
+	planPath := fs.String("plan", "", "plan JSON file")
+	expect := fs.String("expect-digest", "", "digest the plan must have")
+	rootFlag := fs.String("root", "", "workspace root (must match the plan)")
+	jsonOut := fs.Bool("json", false, "emit a JSON result")
+	yes := fs.Bool("y", false, "apply without an interactive prompt")
+	fs.BoolVar(yes, "yes", false, "apply without an interactive prompt")
+	allowProtected := fs.Bool("allow-protected", false, "allow protected paths")
+	allowIgnored := fs.Bool("allow-ignored", false, "allow .aedignore paths")
+	noCheck := fs.Bool("no-check", false, "skip the syntax gate")
+	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets from output")
+	fs.BoolVar(showSecrets, "no-scrub", false, "alias for --show-secrets")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *planPath == "" || *expect == "" {
+		fmt.Fprintln(stderr, "usage: aed apply --plan PLAN.json --expect-digest DIGEST -y [--json]")
+		return 2
+	}
+	if !*yes {
+		fmt.Fprintln(stderr, "error: apply requires -y (non-interactive approval of the plan digest)")
+		return 2
+	}
+	if *jsonOut {
+		defer func() {
+			if code == 0 {
+				return
+			}
+			_ = json.NewEncoder(stdout).Encode(map[string]any{
+				"version": 1, "ok": false, "applied": false,
+				"error": map[string]any{"code": code, "message": exitMessage(code)},
+			})
+		}()
+	}
+
+	data, err := readSmallFile(*planPath, 32<<20)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	var plan applyplan.Plan
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&plan); err != nil {
+		fmt.Fprintf(stderr, "error: decode plan: %v\n", err)
+		return 1
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		fmt.Fprintln(stderr, "error: decode plan: trailing data")
+		return 1
+	}
+	rootArg := *rootFlag
+	if rootArg == "" {
+		rootArg, _ = os.Getwd()
+	}
+	abs, err := filepath.Abs(rootArg)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
+	if abs != plan.Root {
+		fmt.Fprintf(stderr, "conflict: apply root %q does not match the plan root %q\n", abs, plan.Root)
+		return 6
+	}
+	root := abs
+
+	fresh, _, txID, err := applyplan.Apply(root, &plan, *expect, applyplan.Options{
+		AllowProtected: *allowProtected,
+		AllowIgnored:   *allowIgnored,
+		NoSyntaxCheck:  *noCheck,
+	})
+	if err != nil {
+		return reportPlanError(err, stderr)
+	}
+
+	type applyFile struct {
+		Path   string           `json:"path"`
+		Action applyplan.Action `json:"action"`
+		Before string           `json:"before_sha256,omitempty"`
+		After  string           `json:"after_sha256,omitempty"`
+	}
+	res := struct {
+		Version int         `json:"version"`
+		OK      bool        `json:"ok"`
+		Applied bool        `json:"applied"`
+		TXID    string      `json:"tx_id,omitempty"`
+		Digest  string      `json:"plan_digest"`
+		Files   []applyFile `json:"files"`
+	}{Version: 1, OK: true, Applied: true, TXID: txID, Digest: fresh.Digest}
+	for _, f := range fresh.Files {
+		res.Files = append(res.Files, applyFile{Path: f.Path, Action: f.Action, Before: f.BeforeSHA, After: f.AfterSHA})
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(res)
+		return 0
+	}
+	for _, f := range fresh.Files {
+		fmt.Fprintf(stdout, "applied: %s %s\n", f.Action, f.Path)
+	}
+	fmt.Fprintf(stdout, "plan digest: %s\ntx: %s\n", fresh.Digest, txID)
+	return 0
+}
+
+func reportPlanError(err error, stderr io.Writer) int {
+	code := 1
+	switch {
+	case policy.IsDenied(err):
+		code = 5
+	case errorsAsConflict(err):
+		code = 6
+	case errorsAsSyntax(err):
+		code = 4
+	}
+	fmt.Fprintf(stderr, "error: %v\n", err)
+	return code
+}
+
+func errorsAsConflict(err error) bool {
+	_, ok := err.(*applyplan.ConflictError)
+	return ok
+}
+
+func errorsAsSyntax(err error) bool {
+	_, ok := err.(*applyplan.SyntaxError)
+	return ok
+}
+
+// readSmallFile reads a file after an explicit size check.
+func readSmallFile(path string, max int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%s is a symlink; refusing to read it", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Size() > max {
+		return nil, fmt.Errorf("%s exceeds max size %d bytes", path, max)
+	}
+	return os.ReadFile(path) // #nosec G304 -- operator-supplied ops/plan file, size-checked above
+}
+
+func runLog(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("log", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	n := fs.Int("n", 20, "number of records (0 for all)")
+	verify := fs.Bool("verify", false, "verify the hash chain")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *verify {
+		if err := audit.Verify(); err != nil {
+			fmt.Fprintf(stderr, "audit chain INVALID: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stderr, "audit chain ok")
+	}
+	recs, err := audit.Read(*n)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(map[string]any{"records": recs})
+		return 0
+	}
+	for _, r := range recs {
+		fmt.Fprintf(stdout, "%d %s %s tx=%s files=%d root=%s %s\n",
+			r.Seq, r.Time, r.Kind, r.TXID, len(r.Files), r.Root, r.Message)
+	}
+	return 0
+}
+
+func runUndo(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("undo", flag.ContinueOnError)
+	txID := fs.String("tx", "", "transaction id (default: latest)")
+	rootFlag := fs.String("root", "", "workspace root")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	root := *rootFlag
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
+		}
+	}
+	res, err := audit.Undo(root, *txID)
+	if err != nil {
+		return reportAuditError(err, stderr)
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(map[string]any{
+			"ok": true, "tx_id": res.TXID, "files": res.Files,
+		})
+		return 0
+	}
+	fmt.Fprintf(stdout, "undid transaction %s (%d file(s))\n", res.TXID, len(res.Files))
+	return 0
+}
+
+func runRecover(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
+	rootFlag := fs.String("root", "", "workspace root")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	root := *rootFlag
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
+		}
+	}
+	results, err := audit.Recover(root)
+	if err != nil {
+		return reportAuditError(err, stderr)
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(map[string]any{"ok": true, "recovered": results})
+		return 0
+	}
+	if len(results) == 0 {
+		fmt.Fprintln(stdout, "nothing to recover")
+		return 0
+	}
+	for _, r := range results {
+		fmt.Fprintf(stdout, "recovered transaction %s (%d file(s))\n", r.TXID, len(r.Files))
+	}
+	return 0
+}
+
+func reportAuditError(err error, stderr io.Writer) int {
+	code := 1
+	if _, ok := err.(*audit.ConflictError); ok {
+		code = 6
+	}
+	fmt.Fprintf(stderr, "error: %v\n", err)
+	return code
+}
+
+func runMCP(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	rootFlag := fs.String("root", "", "workspace root")
+	allowWrite := fs.Bool("allow-write", false, "allow apply/undo/recover over MCP")
+	allowProtected := fs.Bool("allow-protected", false, "allow protected paths")
+	allowIgnored := fs.Bool("allow-ignored", false, "allow .aedignore paths")
+	showSecrets := fs.Bool("show-secrets", false, "do not redact secrets in tool output")
+	fs.BoolVar(showSecrets, "no-scrub", false, "alias for --show-secrets")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	root := *rootFlag
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
+		}
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
+	srv := &mcp.Server{
+		Root: abs, AllowWrite: *allowWrite, AllowProtected: *allowProtected,
+		AllowIgnored: *allowIgnored, ShowSecrets: *showSecrets,
+		In: stdin, Out: stdout, Err: stderr,
+	}
+	if err := srv.Serve(); err != nil {
+		fmt.Fprintf(stderr, "error: mcp: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runLayaEval(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("laya-eval", flag.ContinueOnError)
+	corpus := fs.String("corpus", "", "labeled JSONL corpus")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	url := fs.String("laya-url", "http://127.0.0.1:8420/mcp/", "Laya MCP URL")
+	token := fs.String("laya-token", os.Getenv("LAYA_MCP_TOKEN"), "Laya MCP token")
+	model := fs.String("laya-safety-model", "", "Laya checkpoint/model name")
+	threshold := fs.Float64("laya-safety-threshold", 0.65, "review threshold")
+	maxReview := fs.Float64("max-review", 0.3, "maximum review rate for the recommended threshold")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *corpus == "" {
+		fmt.Fprintln(stderr, "usage: aed laya-eval --corpus FILE [--json]")
+		return 2
+	}
+	cases, err := layaeval.Load(*corpus)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	client := laya.New(*url, *token)
+	if !client.Configured() {
+		fmt.Fprintln(stderr, "error: --laya-url is required")
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	rep, err := layaeval.Run(ctx, client, cases, layasafety.Options{
+		Model: *model, BlockBelow: *threshold, RequireIntent: true,
+	}, *maxReview)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = json.NewEncoder(stdout).Encode(rep)
+		return 0
+	}
+	fmt.Fprintf(stdout, "cases: %d  review rate: %.2f  FNR: %.2f  ECE: %.3f  recommended threshold: %.2f\n",
+		rep.Total, rep.ReviewRate, rep.FalseNegRate, rep.ECE, rep.Recommended)
+	for _, name := range layaeval.SortedClassNames(rep.Classes) {
+		cs := rep.Classes[name]
+		fmt.Fprintf(stdout, "  %-6s total=%d allow=%d review=%d block=%d recall=%.2f mean_conf=%.2f\n",
+			name, cs.Total, cs.Allow, cs.Review, cs.Block, cs.Recall, cs.MeanConf)
+	}
+	if len(rep.Failures) > 0 {
+		fmt.Fprintln(stdout, "unsafe edits allowed:")
+		for _, f := range rep.Failures {
+			fmt.Fprintf(stdout, "  %s (confidence %.2f)\n", f.ID, f.Conf)
+		}
+	}
+	return 0
+}
+
+// writeFileAtomic writes a small file via a random sibling and rename, refusing
+// a pre-existing symlink. Used for plan output so --out cannot be redirected.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing to write it", path)
+	}
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".aed-out-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+	}
+	if _, err := f.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	return nil
 }

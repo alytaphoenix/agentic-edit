@@ -12,6 +12,18 @@ import (
 	"testing"
 )
 
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "aed-home-*")
+	if err == nil {
+		_ = os.Setenv("HOME", dir)
+	}
+	code := m.Run()
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+	os.Exit(code)
+}
+
 // runEditCmd drives Run and captures stdout+stderr.
 func runEditCmd(dir string, args ...string) (int, string) {
 	return runEditStdin(dir, "n", args...)
@@ -435,5 +447,189 @@ func TestGrepRedactsSecretsByDefault(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), secret) {
 		t.Fatalf("--show-secrets should emit the raw value: %q", out.String())
+	}
+}
+
+// The native engine must preserve BOM, CRLF, and a missing final newline.
+func TestNativeEnginePreservesEncoding(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	orig := "\ufeffone v1\r\ntwo v1"
+	if err := os.WriteFile(path, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y", "--all")
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q", code, out)
+	}
+	got, _ := os.ReadFile(path)
+	want := "\ufeffone v3\r\ntwo v3"
+	if string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestSedEngineStillAvailable(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLine(t, dir, `name = "v1"`)
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y", "--engine=sed")
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); strings.TrimSpace(string(got)) != `name = "v3"` {
+		t.Fatalf("result = %q", got)
+	}
+}
+
+func TestInvalidEngineIsUsageError(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLine(t, dir, `name = "v1"`)
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v3"`, "-f", path, "-y", "--engine=nope")
+	if code != 2 {
+		t.Fatalf("exit=%d out=%q", code, out)
+	}
+}
+
+func TestAedignoreBlocksByDefault(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".aedignore"), []byte("generated/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "generated"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "generated", "f.txt")
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y")
+	if code != 5 {
+		t.Fatalf("exit=%d, want 5; out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "v1\n" {
+		t.Fatalf("ignored file was modified: %q", got)
+	}
+	code, out = runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y", "--allow-ignored")
+	if code != 0 {
+		t.Fatalf("override exit=%d out=%q", code, out)
+	}
+}
+
+func runAed(args ...string) (int, string) {
+	var out, errb bytes.Buffer
+	code := Run(args, strings.NewReader(""), &out, &errb)
+	return code, out.String() + errb.String()
+}
+
+func TestPlanApplyRoundTripAndStaleConflict(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opsPath := filepath.Join(dir, "ops.json")
+	planPath := filepath.Join(dir, "plan.json")
+	ops := `[{"kind":"replace_literal","path":"a.txt","old":"v1","new":"v2","expect_count":1}]`
+	if err := os.WriteFile(opsPath, []byte(ops), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runAed("plan", "--root", dir, "--ops", opsPath, "--out", planPath)
+	if code != 0 {
+		t.Fatalf("plan exit=%d out=%q", code, out)
+	}
+	data, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan map[string]any
+	if err := json.Unmarshal(data, &plan); err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := plan["digest"].(string)
+	code, out = runAed("apply", "--root", dir, "--plan", planPath, "--expect-digest", digest, "-y")
+	if code != 0 {
+		t.Fatalf("apply exit=%d out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "v2\n" {
+		t.Fatalf("content = %q", got)
+	}
+
+	// Rebuild, then change the file: apply must report a conflict.
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out = runAed("plan", "--root", dir, "--ops", opsPath, "--out", planPath)
+	if code != 0 {
+		t.Fatalf("plan2 exit=%d out=%q", code, out)
+	}
+	data, _ = os.ReadFile(planPath)
+	_ = json.Unmarshal(data, &plan)
+	digest, _ = plan["digest"].(string)
+	if err := os.WriteFile(path, []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out = runAed("apply", "--root", dir, "--plan", planPath, "--expect-digest", digest, "-y")
+	if code != 6 {
+		t.Fatalf("stale apply exit=%d, want 6; out=%q", code, out)
+	}
+}
+
+func TestPlanRejectsWrongDigest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opsPath := filepath.Join(dir, "ops.json")
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(opsPath, []byte(`[{"kind":"replace_literal","path":"a.txt","old":"v1","new":"v2","expect_count":1}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := runAed("plan", "--root", dir, "--ops", opsPath, "--out", planPath); code != 0 {
+		t.Fatalf("plan exit=%d out=%q", code, out)
+	}
+	code, out := runAed("apply", "--root", dir, "--plan", planPath, "--expect-digest", "sha256:deadbeef", "-y")
+	if code != 6 {
+		t.Fatalf("exit=%d, want 6; out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "v1\n" {
+		t.Fatalf("file changed: %q", got)
+	}
+}
+
+func TestPlanProtectedPathDenied(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opsPath := filepath.Join(dir, "ops.json")
+	if err := os.WriteFile(opsPath, []byte(`[{"kind":"replace_literal","path":".env","old":"v1","new":"v2","expect_count":1}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runAed("plan", "--root", dir, "--ops", opsPath)
+	if code != 5 {
+		t.Fatalf("exit=%d, want 5; out=%q", code, out)
+	}
+}
+
+func TestUndoRestoresEdit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runEditCmd(dir, "--action", `replace "v1" with "v2"`, "-f", path, "-y")
+	if code != 0 {
+		t.Fatalf("edit exit=%d out=%q", code, out)
+	}
+	code, out = runAed("undo", "--root", dir)
+	if code != 0 {
+		t.Fatalf("undo exit=%d out=%q", code, out)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "v1\n" {
+		t.Fatalf("undo content = %q", got)
+	}
+	if code, out := runAed("log", "--verify", "-n", "10"); code != 0 {
+		t.Fatalf("log verify exit=%d out=%q", code, out)
 	}
 }

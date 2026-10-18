@@ -23,11 +23,12 @@ README table.
 
 Changes must preserve these invariants:
 
-1. A rendered operation can only be one of the typed shapes in
-   `internal/compile`; model output never becomes a raw script.
+1. An operation can only be one of the typed shapes in `internal/ir` or
+   `internal/compile`; model output never becomes a raw script. The native
+   engine is the default; `--engine=sed` is a compatibility backend.
 2. A write is the exact byte sequence that was previewed and checked.
 3. A transaction is all-or-nothing and re-hashes targets immediately before
-   rename.
+   rename. Create/delete/rename/chmod are part of the same transaction.
 4. No predictable sibling temp/backup path is ever opened.
 5. A target symlink, hardlink, device, or non-regular file is refused, and all
    filesystem access goes through `os.Root` so a symlinked parent cannot escape
@@ -38,6 +39,10 @@ Changes must preserve these invariants:
    and missing confidence all deny; a down checker fails closed.
 9. Regex replaces are counted with the same semantics they are executed with,
    and are unique by default like literal replaces.
+10. A plan digest binds ops, paths, hashes, modes, and root; apply must refuse a
+    digest or hash mismatch with exit `6`.
+11. Every apply leaves a before-content journal and a hash-chained audit record;
+    undo must refuse when a file no longer matches its after-hash.
 
 Add a regression test with every safety fix. For filesystem behavior, test
 symlink swaps, concurrent modification, CRLF/BOM, and no-final-newline files.

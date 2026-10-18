@@ -49,6 +49,18 @@ aed edit -a 'uppercase every line' -f notes.txt -y --verify
 
 # Plain grep (recursive when no files are given)
 aed grep -E '^todo' -n *.md
+
+# Two-phase, digest-bound edit for agents
+aed plan --ops ops.json --out plan.json
+aed apply --plan plan.json --expect-digest sha256:... -y --json
+
+# Audit, undo, and crash recovery
+aed log -n 10
+aed undo
+aed recover
+
+# Safe MCP server (read-only unless --allow-write)
+aed mcp --root . --allow-write
 ```
 
 ### `edit` options
@@ -72,6 +84,8 @@ aed grep -E '^todo' -n *.md
 | `--laya-safety-threshold` | Confidence below this becomes `review` (default `0.65`). |
 | `--show-secrets` | Do not redact secrets from LLM prompts, stdout diffs, `grep` output, and the review prompt. Alias: `--no-scrub`. **Default off (scrub on).** |
 | `--allow-protected` | Allow editing protected paths (`.git/`, CI workflows, keys, `.env`, shell rc, Makefile, ...). |
+| `--allow-ignored` | Allow editing paths matched by `.aedignore`. |
+| `--engine` | `native` (default, in-process) or `sed` (compatibility backend). |
 | `--llm` | Enable an Ollama / OpenAI-compatible model to plan the edit (**opt-in**). Laya itself is a decision model, not a generator. |
 | `--no-llm` | Skip LLM assistance; use the deterministic generator only. |
 | `--force` | Allow whole-file destructive deletes (e.g. delete matching `.`). |
@@ -108,6 +122,80 @@ Runs each file's language syntax checker and prints diagnostics in
 any file has syntax problems. Returns early on I/O or binary/size errors (exit
 `1`). Unsupported file types are reported as skipped, not as failures.
 
+### `plan` / `apply` subcommands
+
+```sh
+aed plan  --ops OPS.json [--out PLAN.json] [--json]
+aed apply --plan PLAN.json --expect-digest DIGEST -y [--json]
+```
+
+`plan` reads a strict JSON array (or `{"version":1,"ops":[...]}`) of typed
+operations, applies them in memory, and emits a canonical plan containing the
+before/after SHA-256 for every file, the diff, diagnostics, and a digest over
+the ops, root, paths, hashes, and modes. `apply` requires that digest, re-reads
+the files, rebuilds the plan, and refuses with exit `6` if anything changed. It
+runs the syntax gate and policy checks again before committing one transaction.
+
+Supported ops:
+
+| `kind` | Fields |
+|---|---|
+| `replace_literal` | `path`, `old`, `new`, `expect_count` **or** `global:true` |
+| `replace_regex` | same, RE2 syntax |
+| `insert` | `path`, `anchor`, `text`, `insert_before`, `all` |
+| `replace_range` / `delete_range` | `path`, `start`, `end`, `text` (replace only) |
+| `apply_patch` | `path`, `patch` (strict unified diff) |
+| `create_file` | `path`, `content`, `mode` |
+| `delete_file` | `path` |
+| `rename_file` | `from`, `to` |
+| `chmod` | `path`, `mode` |
+
+Paths are relative to the root, must be clean, and cannot escape with `..`.
+Unknown fields and fields not valid for the operation kind are rejected.
+`--out` is confined to the workspace root and written atomically (0600); plan
+files are inputs to `apply`, so keep them out of `.aedignore`d trees.
+
+### `log`, `undo`, `recover`
+
+```sh
+aed log [-n N] [--json] [--verify]
+aed undo [--tx ID] [--root DIR] [--json]
+aed recover [--root DIR] [--json]
+```
+
+Every successful apply appends a hash-chained JSONL record under
+`~/.local/state/aed/` (mode `0700`) with the transaction id, root, instruction,
+and per-file before/after hashes. `log --verify` checks the chain.
+`undo` restores the latest (or named) transaction, but only if every file still
+matches the recorded after-hash. A crash journal with before-content blobs is
+written before the first rename, so `recover` can roll back an interrupted
+transaction.
+
+### `mcp` subcommand
+
+```sh
+aed mcp [--root DIR] [--allow-write] [--allow-protected] [--allow-ignored] [--show-secrets]
+```
+
+Speaks MCP over stdio (newline-delimited JSON-RPC). Tools: `read`, `search`,
+`check`, `plan`, `apply`, `undo`, `recover`, `log`, `status`. The server is
+read-only unless `--allow-write` is passed; `apply` additionally requires the
+plan digest. All paths are confined to `--root` and go through the same policy,
+syntax gate, transaction, and audit log as the CLI.
+
+### Laya evaluation
+
+```sh
+aed laya-eval --corpus cases.jsonl --json \
+  --laya-url http://127.0.0.1:8420/mcp/ --laya-token "$LAYA_MCP_TOKEN"
+```
+
+Runs a labeled corpus through `layasafety`, reporting per-class recall, the
+false-negative rate (unsafe edit allowed), review rate, expected calibration
+error, and a recommended threshold for a target review budget. See
+`internal/layaeval/testdata/corpus.jsonl` for the format and README's Laya
+section for the fine-tuning workflow.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -124,46 +212,51 @@ any file has syntax problems. Returns early on I/O or binary/size errors (exit
 ## How it works
 
 ```
-natural-language instruction
+instruction / ops.json
+          │
+          ├─ edit → plan.Parse → intent grammar → typed ops
+          └─ plan → ir.Parse → strict typed ops + digest
           │
           ▼
-   plan.Parse            → structured intent + target files
+   policy (root confinement, protected paths, .aedignore, limits)
           │
           ▼
-   plan.Enrich (optional) → background context from a chat-capable MCP tool
+   native engine (default) ── or ── sed compatibility backend (--engine=sed)
           │
           ▼
-   gen.Generate          → typed ops via intent.Parse + compile.Render
-         └─ LLM (opt-in, --llm) → emits typed ops only, validated before render
-          │
-          ▼
-   safety.Validate       → structural template check + denylist for hand-built ops
-          │
-          ▼
-   Dry-run (in-memory)   → unified diff; grep-only plans are read-only searches
+   Safety.Validate + Laya edit-risk decision (warn/block, fail-closed)
           │
           ▼
    Syntax gate (internal/lang) — per-language parse of the in-memory result
           │
           ▼
-   Optional Laya safety  → allow / review / block (advisory or fail-closed)
+   Transaction (internal/tx) — os.Root → hash guard → stage → fsync → rename
           │
           ▼
-   Transaction (internal/tx) → hash guard → stage → fsync → atomic rename
+   Audit journal (before blobs) + hash-chained JSONL record
           │
           ▼
-   Verify (hash + asserts + diff summary) → rollback on failure
+   Verify (hash + asserts) → rollback · undo · recover
 ```
 
 By default the tool is fully deterministic: a small keyword grammar turns the
-instruction into **typed operations**, which are rendered through a fixed
-template whitelist. The LLM is strictly **opt-in** (`--llm`); when used, the
-model may only emit structured, typed operations, which are validated before
-rendering. Unknown JSON fields are rejected.
+instruction into **typed operations**, which the in-process native engine
+applies without a shell. `--engine=sed` keeps the awk/sed backend for
+compatibility. The LLM is strictly **opt-in** (`--llm`); when used, the model may
+only emit structured, typed operations, which are validated before rendering.
+Unknown JSON fields are rejected.
+
+For agents, `plan`/`apply` split the operation in two: the plan is canonical and
+digest-bound, and apply revalidates the digest, hashes, policy, and syntax before
+writing. This removes the preview/apply drift that a single-step edit can have.
+
 ### Safety
 
-- **Safe by construction**: commands are produced from a fixed template
-  whitelist (`internal/compile`) by escaping inputs. Replace is **literal by
+- **Safe by construction**: edit instructions are parsed into a fixed set of
+  typed operations and applied by the in-process native engine (`internal/native`)
+  with no shell. The sed backend (also fixed-template) remains available for
+  compatibility. Operations are produced from a whitelist (`internal/compile`)
+  by escaping inputs. Replace is **literal by
   default** and requires exactly one match unless `--all` is passed.
   `"regex": true` opts into POSIX ERE (`sed -E`) matching and is still
   unique-by-default; patterns whose meaning differs between Go's regexp (used
@@ -196,6 +289,18 @@ rendering. Unknown JSON fields are rejected.
 - **Binary / size guard**: files over 50 MB or containing NUL bytes are
   rejected. The size limit is enforced before the read, so an oversized file
   cannot exhaust memory just by being opened.
+- **Blast-radius limits**: at most 32 files, 256 MB of read+write content, 5,000
+  changed lines, 2,500 deletions, and a 4 MB diff per operation. Limits are
+  checked while building the plan, before the transaction.
+- **`.aedignore`**: root-relative glob patterns can mark generated or vendored
+  trees as off-limits; `--allow-ignored` is required to override them.
+- **Digest-bound plans**: `aed plan` binds ops, paths, hashes, modes, and the
+  root into a SHA-256 digest; `aed apply` revalidates it and rebuilds the plan
+  before writing, so a preview cannot drift from the applied bytes.
+- **Auditable and reversible**: every apply writes a pending before-content
+  journal plus a hash-chained audit record. `aed undo` restores the last
+  transaction when the files still match its after-hashes; `aed recover`
+  finishes or rolls back a transaction interrupted by a crash.
 - **Mode preservation + fsync**: the original mode (including executable bits)
   is preserved across the atomic rename; the file and its directory are fsynced.
 - **Exec timeout**: every awk/sed/grep call is bounded (`exec.DefaultTimeout`,
@@ -308,13 +413,20 @@ safety gate, fine-tune and calibrate a checkpoint on your own edit corpus:
 | Package | Responsibility |
 |---------|----------------|
 | `cmd/aed` | CLI entrypoint |
-| `internal/cli` | Flag parsing, the edit/grep command loop |
+| `internal/cli` | Flag parsing, edit/plan/apply/grep/log/undo/recover/mcp loops |
 | `internal/plan` | Intent parsing + optional chat-capable context enrichment |
 | `internal/intent` | Parses instruction into typed ops; validates structure |
 | `internal/compile` | Renders typed ops through a fixed safe-template whitelist |
 | `internal/gen` | Wires LLM (opt-in, typed ops only) + deterministic pipeline |
-| `internal/exec` | `DryRun`/`RunInPlace`, literal/regex replaces, grep search, bounded diff |
-| `internal/tx` | Hash-guarded, atomic, all-or-nothing file transactions |
+| `internal/native` | In-process, byte-stable edit engine (BOM/CRLF/final newline) |
+| `internal/ir` | Strict typed ops, unknown-field rejection, plan limits |
+| `internal/applyplan` | Canonical plan, digest, revalidation, apply |
+| `internal/policy` | Root confinement, protected paths, `.aedignore`, blast-radius limits |
+| `internal/audit` | Hash-chained JSONL log, before-content journal, undo/recover |
+| `internal/mcp` | Read-only-by-default MCP stdio server |
+| `internal/layaeval` | Recall/FNR/ECE evaluation and threshold recommendation |
+| `internal/exec` | sed/awk/grep DryRun backend, grep search, bounded diff |
+| `internal/tx` | Root-confined, hash-guarded, all-or-nothing transactions (update/create/delete/rename/chmod) |
 | `internal/safety` | Structural template check + denylist for hand-built ops |
 | `internal/lang` | Per-language syntax gate (pluggable: bash, python today; CommandChecker adapts any CLI) |
 | `internal/scrub` | Redacts secrets from LLM prompts, stdout, and the review prompt |
@@ -329,4 +441,12 @@ safety gate, fine-tune and calibrate a checkpoint on your own edit corpus:
 go test ./...
 go test -race ./...
 go vet ./...
+go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
+
+The suite covers the native engine (BOM/CRLF/final newline), IR validation,
+digest tampering and stale plans, create/delete/rename/chmod transactions,
+symlink and parent-escape attacks, crash recovery, audit-chain tampering, MCP
+tool calls, Laya fail-closed normalization, and macro evaluation metrics.

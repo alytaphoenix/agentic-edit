@@ -13,8 +13,9 @@ and whether `--llm` / `--laya-safety` were enabled.
 
 Guarantees:
 
-- Edits are rendered from a fixed typed-op whitelist. Free-form shell scripts
-  are not accepted.
+- Edits are typed operations applied in-process by the native engine (no
+  shell); the optional sed backend is also fixed-template. Free-form shell
+  scripts are not accepted.
 - Writes are byte-exact and all-or-nothing: a transaction stages exact bytes,
   fsyncs, re-hashes the target immediately before an atomic rename, and restores
   every file on failure.
@@ -23,8 +24,17 @@ Guarantees:
   tree. Symlinks, hardlinks, and non-regular files are refused. Protected paths
   (VCS internals, CI, keys, `.env`, shell rc, build files) require
   `--allow-protected`.
-- Secrets are redacted from model prompts, `grep` output, and stdout diffs
-  unless `--show-secrets` is set.
+- Secrets are redacted from model prompts, `grep` output, MCP tool output, and
+  stdout diffs unless `--show-secrets` is set.
+- Plans are canonical and digest-bound. `apply` revalidates the digest, hashes,
+  policy, and syntax before writing, and refuses a stale plan with exit `6`.
+- Blast-radius limits bound files, bytes, changed lines, deletions, and diff
+  size. `.aedignore` marks generated trees off-limits.
+- Every apply writes a before-content journal and a hash-chained audit record
+  under `~/.local/state/aed` (0700). `undo` refuses if a file changed; `recover`
+  is the only path that writes from a pending journal. Before-blobs can contain
+  file content, including secrets; protect the state directory like the
+  workspace itself.
 - Laya can escalate a decision, never grant one that deterministic policy or the
   syntax gate denies. In `block` mode a `review`, an unknown risk value, or a
   missing confidence is a denial; a down checker exits `8`.
@@ -48,7 +58,10 @@ after any dependency change. `aed` has no third-party runtime dependencies.
 
 - Run with an explicit `--root` and a dedicated capability profile.
 - Keep `--laya-safety=block`: it denies `review` as well as `block`, and exits
-  `8` when the checker is down.
+  `8` when the checker is down. Calibrate its threshold with `aed laya-eval`
+  against a labeled corpus.
+- For MCP deployments, keep the server read-only unless the client has an
+  explicit approval path for plan digests; `--allow-write` enables apply/undo.
 - Deny network egress for the agent and the local model.
 - Never expose `--allow-protected` to an untrusted agent.
 - Keep `--json` output and audit logs; scrub them before sharing.
