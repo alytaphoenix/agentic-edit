@@ -5,6 +5,7 @@
 ```sh
 go build -o aed ./cmd/aed
 go test ./...
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 go test -race ./...
 go vet ./...
 ```
@@ -28,10 +29,15 @@ Changes must preserve these invariants:
 3. A transaction is all-or-nothing and re-hashes targets immediately before
    rename.
 4. No predictable sibling temp/backup path is ever opened.
-5. A target symlink, hardlink, device, or non-regular file is refused.
+5. A target symlink, hardlink, device, or non-regular file is refused, and all
+   filesystem access goes through `os.Root` so a symlinked parent cannot escape
+   the workspace.
 6. A stale target is a conflict, never an overwrite.
 7. The syntax gate runs before the write; verification runs after it.
-8. Laya may only escalate a decision.
+8. Laya may only escalate a decision. In `block` mode, `review`, unknown risks,
+   and missing confidence all deny; a down checker fails closed.
+9. Regex replaces are counted with the same semantics they are executed with,
+   and are unique by default like literal replaces.
 
 Add a regression test with every safety fix. For filesystem behavior, test
 symlink swaps, concurrent modification, CRLF/BOM, and no-final-newline files.

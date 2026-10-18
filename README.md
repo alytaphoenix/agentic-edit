@@ -20,7 +20,7 @@ For agents, `aed edit --json` emits a stable machine-readable result, and
 go build -o aed ./cmd/aed
 ```
 
-Requires Go 1.26+.
+Requires Go 1.26.9+ (the os.Root and net/http fixes in that patch release are part of the security model).
 
 ## Usage
 
@@ -63,14 +63,14 @@ aed grep -E '^todo' -n *.md
 | `--no-verify` | Disable the post-apply verification guard. A guard failure exits `3` and rolls back. |
 | `--check` | Syntax-check the edited result with the language's own parser **before** applying. **Default on** (a regression exits `4`). |
 | `--no-check` | Skip the pre-apply syntax check. |
-| `--unique` | Require exactly one match for each replace. **Default on.** |
+| `--unique` | Require exactly one match for each literal or regex replace. **Default on.** |
 | `--all` | Allow a replace to match more than once (turns off `--unique`). |
 | `--keep-on-failure` | Keep the edited file if verification fails. Default is automatic rollback. |
 | `--json` | Emit one JSON result on stdout; human progress goes to stderr. |
 | `--laya-safety` | `off` (default), `warn`, or `block`. Runs a Laya edit-risk decision over the diff. |
 | `--laya-safety-model` | Laya checkpoint/model name (default: server `auto`). |
 | `--laya-safety-threshold` | Confidence below this becomes `review` (default `0.65`). |
-| `--show-secrets` | Do not redact secrets from LLM prompts, stdout diffs, and the review prompt. Alias: `--no-scrub`. **Default off (scrub on).** |
+| `--show-secrets` | Do not redact secrets from LLM prompts, stdout diffs, `grep` output, and the review prompt. Alias: `--no-scrub`. **Default off (scrub on).** |
 | `--allow-protected` | Allow editing protected paths (`.git/`, CI workflows, keys, `.env`, shell rc, Makefile, ...). |
 | `--llm` | Enable an Ollama / OpenAI-compatible model to plan the edit (**opt-in**). Laya itself is a decision model, not a generator. |
 | `--no-llm` | Skip LLM assistance; use the deterministic generator only. |
@@ -87,14 +87,15 @@ aed grep -E '^todo' -n *.md
 ### `grep` subcommand
 
 ```sh
-aed grep [-E] [-c] [--json] PATTERN [FILE...]
+aed grep [-E] [-c] [--json] [--show-secrets] PATTERN [FILE...]
 ```
 
 A thin wrapper over `grep -Hn` (`-E` for extended regex, `-c` for counts).
 With no `FILE` arguments it searches recursively from the current directory
 (`grep -rHn`) instead of passing `.` to non-recursive grep. `--json` emits
-`{"matches":[...]}` or `{"counts":{...}}`. It exits `0` when nothing matches, so
-it is safe in scripts and previews.
+`{"matches":[...]}` or `{"counts":{...}}`. Match text is secret-scrubbed by
+default; pass `--show-secrets` (alias `--no-scrub`) to print it raw. It exits `0`
+when nothing matches, so it is safe in scripts and previews.
 
 ### `check` subcommand
 
@@ -116,7 +117,7 @@ any file has syntax problems. Returns early on I/O or binary/size errors (exit
 | `2` | Usage error (unknown command / missing required flag / invalid safety mode). |
 | `3` | Post-apply verify guard failed. The transaction is rolled back unless `--keep-on-failure`. |
 | `4` | Syntax gate: the edit would leave invalid syntax. Override with `--no-check`. |
-| `5` | Policy denied (protected path, Laya `block`, or destructive edit). |
+| `5` | Policy denied (protected path, Laya `block`/`review`, or destructive edit). |
 | `6` | Conflict: a target changed after preview, or the workspace lock is held. |
 | `8` | Safety checker unavailable while `--laya-safety=block` (fail closed). |
 
@@ -163,41 +164,50 @@ rendering. Unknown JSON fields are rejected.
 
 - **Safe by construction**: commands are produced from a fixed template
   whitelist (`internal/compile`) by escaping inputs. Replace is **literal by
-  default** (`"regex": true` in a typed op opts into sed regex matching), and
-  `scope` addresses are restricted to a single `/regex/` with command separators
-  rejected. A free-form script cannot be injected.
-- **Byte-exact transaction**: `internal/tx` stages the exact bytes that were
-  previewed and syntax-checked, fsyncs them, re-checks the original hash, and
-  renames atomically. There is no separate re-execution of `sed` at apply time.
+  default** and requires exactly one match unless `--all` is passed.
+  `"regex": true` opts into POSIX ERE (`sed -E`) matching and is still
+  unique-by-default; patterns whose meaning differs between Go's regexp (used
+  for the count guard) and sed are rejected. `scope` addresses must be a single
+  `/regex/`, and separators, braces, `!`, `#`, and backslashes are refused. A
+  free-form script cannot be injected.
+- **Root-confined transaction**: `internal/tx` opens the workspace with
+  `os.Root`, so every read, stage, rename, and rollback is confined to that tree
+  even if a parent directory is swapped for a symlink. It stages the exact bytes
+  that were previewed and syntax-checked, fsyncs them, re-checks the original
+  hash immediately before each rename, and renames atomically. There is no
+  separate re-execution of `sed` at apply time.
 - **All-or-nothing rollback**: every touched file is part of one transaction. A
   failure at any point restores every file already replaced. `--keep-on-failure`
   opts out of the automatic rollback after a failed verify.
 - **No predictable sibling paths**: the old `file.bak` / `file.aed.tmp` names are
-  gone. Staging files use `os.CreateTemp` (random, `O_EXCL`) in the target
-  directory, so a pre-created symlink cannot redirect a write.
+  gone. Staging files use random `.aed-<random>` names created with `O_EXCL`
+  through the root, so a pre-created symlink cannot redirect a write.
 - **Symlink/hardlink refusal**: target symlinks, hardlinked files, devices, and
   other non-regular files are rejected. `..` escapes and symlinked paths outside
   `--root` are refused.
 - **Hash stale-edit guard**: each target's SHA-256 is re-checked immediately
   before the rename; a concurrent change returns exit `6` instead of being
   overwritten. A per-workspace advisory lock serialises aed transactions.
-- **Protected paths**: `.git/`, `.hg/`, `.ssh/`, CI workflows, `.env`, keys,
-  credentials, shell rc files, Makefiles, Dockerfiles, and similar
-  code-execution/credential surfaces are refused unless `--allow-protected` is
-  passed.
+- **Protected paths**: `.git/`, `.hg/`, `.ssh/`, CI workflows and actions,
+  `.env`, keys/keystores, credentials, shell rc files, Makefiles, Dockerfiles,
+  git hooks, and similar code-execution/credential surfaces are refused unless
+  `--allow-protected` is passed. Matching is case-insensitive so `makefile` and
+  `Dockerfile.dev` are covered too.
 - **Binary / size guard**: files over 50 MB or containing NUL bytes are
-  rejected up front.
+  rejected. The size limit is enforced before the read, so an oversized file
+  cannot exhaust memory just by being opened.
 - **Mode preservation + fsync**: the original mode (including executable bits)
   is preserved across the atomic rename; the file and its directory are fsynced.
 - **Exec timeout**: every awk/sed/grep call is bounded (`exec.DefaultTimeout`,
   30s).
 - **Private temp dir**: sed scripts live in a process-private directory that is
   cleaned up on exit.
-- **Secret scrubbing**: file contents, instructions, printed diffs, and the
-  verify-review prompt are redacted by `internal/scrub` (AWS keys, private keys,
-  tokens, connection strings, `key = value` assignments) unless `--show-secrets`
-  (alias `--no-scrub`) is passed. Redaction is output-only — it never changes
-  what is written to disk.
+- **Secret scrubbing**: file contents, instructions, printed diffs, `grep`
+  output, and the verify-review prompt are redacted by `internal/scrub` (AWS,
+  OpenAI, Anthropic, GitHub, GitLab, Slack, Google, and Stripe tokens, JWTs,
+  private keys, connection strings, and `key = value` assignments — including
+  quoted values) unless `--show-secrets` (alias `--no-scrub`) is passed.
+  Redaction is output-only — it never changes what is written to disk.
 - **Post-apply guard**: `verify` asserts the change actually landed (Assert =
   new value present, Deny = old value / deleted pattern absent), skips no-ops,
   and prints an error diff. A failure exits `3` and rolls the whole transaction
@@ -267,10 +277,12 @@ diff, change stats, and deterministic flags; Laya returns a `risk`
 `secret_exposure`.
 
 Policy is monotonic: deterministic checks and the syntax gate remain
-authoritative, and Laya can only **escalate** (allow → review → block). A
-high-confidence `block` exits `5`; a low-confidence `allow` becomes `review`; if
-Laya is unavailable in `block` mode, aed exits `8` rather than silently
-continuing.
+authoritative, and Laya can only **escalate** (allow → review → block). In
+`block` mode a `review` is also a denial (`5`), not permission to proceed: only
+a high-confidence `allow` whose `intent_match` is at least "mostly" is applied.
+`warn` mode prints the verdict and continues. If Laya is unavailable in `block`
+mode, aed exits `8` rather than silently continuing. Unknown or missing risk
+values and missing confidence are treated as `review`, never `allow`.
 
 Important: Laya is a fast decision model, not a generative LLM. The shipped base
 checkpoints are near chance zero-shot on typed decisions (its own benchmark:
