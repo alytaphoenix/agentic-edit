@@ -33,10 +33,11 @@ import (
 	"agentic-edit/internal/scrub"
 	"agentic-edit/internal/tx"
 	"agentic-edit/internal/verify"
+	"agentic-edit/internal/version"
 )
 
 // Version is the CLI version reported by `aed version`.
-const Version = "0.3.0"
+const Version = version.Version
 
 const usageText = `aed — agentic file editing with awk/sed/grep + Laya
 

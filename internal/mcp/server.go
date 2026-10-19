@@ -22,10 +22,11 @@ import (
 	"agentic-edit/internal/policy"
 	"agentic-edit/internal/scrub"
 	"agentic-edit/internal/tx"
+	"agentic-edit/internal/version"
 )
 
 // Version is the MCP server version.
-const Version = "0.3.0"
+const Version = version.Version
 
 // maxMessage bounds a single JSON-RPC line.
 const maxMessage = 8 << 20

@@ -14,6 +14,8 @@ by hash after applying.
 For agents, `aed edit --json` emits a stable machine-readable result, and
 `--laya-safety=warn|block` adds a local decision-model review of the diff.
 
+Current version: **0.4.0** (see [CHANGELOG.md](CHANGELOG.md)).
+
 ## Install / build
 
 ```sh

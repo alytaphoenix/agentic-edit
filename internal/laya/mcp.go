@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"agentic-edit/internal/version"
 )
 
 // maxResponseBytes bounds an MCP response body. A local server that returns a
@@ -83,7 +85,7 @@ func (c *Client) ensureInit(ctx context.Context) error {
 	_, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "aed", "version": "0.2.0"},
+		"clientInfo":      map[string]any{"name": "aed", "version": version.Version},
 	})
 	if err != nil {
 		return err

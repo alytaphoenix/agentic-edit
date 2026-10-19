@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"agentic-edit/internal/version"
 )
 
 func TestMain(m *testing.M) {
@@ -631,5 +633,15 @@ func TestUndoRestoresEdit(t *testing.T) {
 	}
 	if code, out := runAed("log", "--verify", "-n", "10"); code != 0 {
 		t.Fatalf("log verify exit=%d out=%q", code, out)
+	}
+}
+
+func TestVersionIsShared(t *testing.T) {
+	if Version != version.Version {
+		t.Fatalf("CLI version %q != shared version %q", Version, version.Version)
+	}
+	code, out := runAed("version")
+	if code != 0 || !strings.Contains(out, "aed "+version.Version) {
+		t.Fatalf("version exit=%d out=%q", code, out)
 	}
 }
